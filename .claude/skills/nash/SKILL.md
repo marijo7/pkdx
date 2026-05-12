@@ -14,7 +14,10 @@ allowed-tools: Bash, Read, AskUserQuestion
 SKILL_DIR=（このSKILL.mdが置かれたディレクトリ）
 REPO_ROOT=$SKILL_DIR/../../../..
 PKDX=$REPO_ROOT/bin/pkdx
+VIZ=$REPO_ROOT/scripts/select_grid_viz.sh   # pkdx select の進捗可視化
 ```
+
+`$VIZ` は `pkdx select --progress=json` の stderr (JSON Lines) を受け取り、stdout が TTY なら 60×60 グリッドを live 描画、TTY 以外では phase 境界 + dp ノードサマリの数行ログに自動切替する。`pkdx select` を呼ぶときは原則として `2> >($VIZ)` を付ける。Phase 2b では実行主体 (エージェント / ユーザー手動) を AskUserQuestion で選ばせる。
 
 ## 用語
 
@@ -24,7 +27,7 @@ PKDX=$REPO_ROOT/bin/pkdx
 | exploitability | 現在の戦略 σ に対する最良応答で得られる追加利得。零和で 0 なら σ は Nash 均衡 |
 | support | 確率 > 0 の純戦略 index 集合 |
 | TeamPayoffModel | 利得の作り方 (`switching_game` / `screened_switching_game:<trials>:<seed>:<keep_top>`)。turn_limit 既定は MC=5 / DP=5 (`switching_game:<N>` で個別上書き可) |
-| BattleFormat | `single` = 3 体選出 (20x20) のみ対応 (`double` は現状未サポート) |
+| BattleFormat | `single` = lead-aware 3 体選出 (60x60、`6 × C(5,2) = 60` 通りで先頭 (lead) を含む順序付きタプル) のみ対応 (`double` は現状未サポート) |
 
 詳細はまず `references/` を参照:
 - `references/theory.md` — 零和 LP / Simplex / Fictitious play / MWU の数式と根拠
@@ -43,7 +46,7 @@ NOT_FOUND の場合は以下を案内してスキルを終了:
 ```
 pkdx CLI が見つかりません。リポジトリルートで以下を実行:
   ./setup.sh
-  cd pkdx && moon build --target native src/main
+  moon build --target native src/main
 ```
 
 ## Phase 1: タスク選択 (AskUserQuestion)
@@ -184,11 +187,12 @@ ls box/teams/*.meta.json
 
 ### 実行
 
+#### 1. 入力 JSON をファイルへ保存
+
+実行主体に関わらず、入力 JSON はまず `/tmp/pkdx_select_input.json` に書き出す (ユーザー手動ルートでも同じファイルを参照させるため heredoc ではなくファイル経由に統一する)。技の priority / stat_effects は `pkdx moves` 出力をそのまま流せる。省略時はデフォルト (priority=0 / stat_effects=[]) 扱い。
+
 ```bash
-# 技の priority / stat_effects は `pkdx moves` の出力にそのまま乗ってくる
-# ので、stdin JSON にはそのままコピペすれば DB 由来の情報が伝わる。
-# 省略した場合はデフォルト (priority=0 / stat_effects=[]) で扱われる。
-cat <<'JSON' | $PKDX select
+cat > /tmp/pkdx_select_input.json <<'JSON'
 {
   "team": [
     {"name":"P0","type1":"ノーマル","type2":"","hp":100,"atk":100,"def":80,"spa":80,"spd":80,"spe":100,
@@ -206,13 +210,60 @@ JSON
 
 `<N>` は直前の AskUserQuestion で得た値を埋める (おまかせ=5 / じっくり読む=10 / サクッと=3、Other 入力時はその正整数)。`screened_switching_game` を選んだ場合は `"screened_switching_game:1000:42:0.3:<N>"` のように 4 番目のフィールドとして同じ値を付ける。
 
+#### 2. 実行主体の決定 (AskUserQuestion)
+
+| # | 質問 | header | オプション |
+|---|------|--------|-----------|
+| 1 | 計算を誰が実行しますか？ | 実行主体 | エージェントが実行（結果だけ受け取る）, ターミナルで自分で実行（計算過程をグリッドで見たい） |
+
+ユーザー視点の言い換え（質問・選択肢の文面はこちら、内部分岐は下記）:
+
+| ラベル | 挙動 | こう案内する |
+|---|---|---|
+| エージェントが実行 | skill が直接 Bash 実行 | サクッと結果だけ欲しいとき。進捗は `[viz] phase ... done` の数行ログのみ |
+| ターミナルで自分で実行 | コマンドを提示してユーザーが別ターミナルで実行 | 計算過程を 60×60 グリッドで眺めたいとき。長めの計算で進捗を視覚的に追える |
+
+#### 3a. 「エージェントが実行」を選んだ場合
+
+```bash
+$PKDX select --progress=json 2> >($VIZ) > /tmp/pkdx_select_result.json < /tmp/pkdx_select_input.json
+cat /tmp/pkdx_select_result.json   # ← 結果整形フェーズで使う
+```
+
+**進捗フィードバックを止めたい場合**: `--progress=off` (既定値) を明示するか、`2> >($VIZ)` を外す。長い `--progress-every` を渡せば dp ノードサンプル頻度を間引ける (例: `--progress-every=5000`)。
+
+#### 3b. 「ターミナルで自分で実行」を選んだ場合
+
+1. ユーザーへコマンドを提示する。`<REPO_ROOT>` は `pwd` で取得した実体パス (例: `/Users/.../pkdx`) に展開し、コードブロックでそのままコピペできる形で渡すこと:
+
+   ````markdown
+   別ターミナルで以下を実行してください。完了したら次の選択肢で教えてください。
+
+   ```bash
+   cd <REPO_ROOT> && cat /tmp/pkdx_select_input.json \
+     | bin/pkdx select --progress=json 2> >(scripts/select_grid_viz.sh) \
+     > /tmp/pkdx_select_result.json
+   ```
+   ````
+
+2. 提示後、AskUserQuestion で完了確認を取る:
+
+   | # | 質問 | header | オプション |
+   |---|------|--------|-----------|
+   | 1 | 実行は完了しましたか？ | 実行状況 | 完了したので結果を見せて, やっぱりエージェントに実行させる, キャンセル |
+
+3. 分岐:
+   - **完了したので結果を見せて**: `/tmp/pkdx_select_result.json` を Read で読み込み、結果整形フェーズへ進む。ファイル不在 / 空 / `value` キー欠落のときはエラーを伝えて再実行 or フォールバックを促す
+   - **やっぱりエージェントに実行させる**: 3a へフォールバック
+   - **キャンセル**: スキルを終了
+
 出力:
 ```json
 {
   "format": "single",
   "value": 0.0,
   "exploitability": 0.0,
-  "selections": [[0,1,2], [0,1,3], ...],
+  "selections": [[0,1,2], [0,1,3], ..., [1,0,2], ...],
   "selection_names": [["P0","P1","P2"], ...],
   "opp_selections": [...],
   "opp_selection_names": [...],
@@ -221,9 +272,11 @@ JSON
 }
 ```
 
+各 selection は `[lead, b1, b2]` の **順序付きタプル**で、**位置 0 が先頭選出 (lead)**、後ろ 2 体は控え (昇順)。シングル 6v6 では `6 × C(5,2) = 60` 通り列挙されるので `row_strategy` / `col_strategy` も長さ 60。同じメンバー集合でも先頭が違えば別エントリ扱いになる点に注意 (例: `[0,1,2]` と `[1,0,2]` は別物)。
+
 ### 結果整形
 
-確率 > 1% の選出のみ表示:
+確率 > 1% の選出のみ表示。先頭の Pokémon は **太字**で強調する:
 
 ```markdown
 ## 選出分布 ({format})
@@ -232,9 +285,9 @@ JSON
 - **exploitability**: {exploitability:.6f}
 
 ### 採用すべき選出
-| 確率 | 選出メンバー |
+| 確率 | 先頭 → 控え |
 |---|---|
-| {p:.1%} | {names} |
+| {p:.1%} | **{names[0]}** → {names[1]}, {names[2]} |
 ...
 
 ### 相手の最適選出

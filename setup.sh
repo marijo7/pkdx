@@ -3,7 +3,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO="pkdxtools/pkdx"
-LEGACY_REPO="ushironoko/pkdx"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/pkdx"
 
 # --- OS/Arch detection ---
@@ -37,22 +36,12 @@ ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
 
 echo "[0/4] Remote configuration..."
 
-# Migrate legacy upstream URL (ushironoko/pkdx -> pkdxtools/pkdx) in place.
-# Redirects keep fetch working, but we want the authoritative name stored.
-if git -C "$REPO_ROOT" remote get-url upstream &>/dev/null; then
-  CURRENT_UPSTREAM_URL="$(git -C "$REPO_ROOT" remote get-url upstream)"
-  if echo "$CURRENT_UPSTREAM_URL" | grep -q "$LEGACY_REPO"; then
-    NEW_UPSTREAM_URL="$(echo "$CURRENT_UPSTREAM_URL" | sed "s|$LEGACY_REPO|$UPSTREAM_REPO|")"
-    git -C "$REPO_ROOT" remote set-url upstream "$NEW_UPSTREAM_URL"
-    echo "  Migrated upstream URL: $LEGACY_REPO -> $UPSTREAM_REPO"
-  fi
-fi
-
-if echo "$ORIGIN_URL" | grep -qE "($UPSTREAM_REPO|$LEGACY_REPO)"; then
-  # origin is the upstream repo itself (clone setup)
+if echo "$ORIGIN_URL" | grep -qE "[:/]$UPSTREAM_REPO(\.git)?/?$"; then
+  # origin is the canonical upstream repo itself (clone setup)
   echo "  Clone setup detected. No additional remote needed."
 else
-  # origin is a fork
+  # origin is a fork. Add upstream so `git fetch upstream` can pull the
+  # latest release / version bump.
   if git -C "$REPO_ROOT" remote get-url upstream &>/dev/null; then
     echo "  upstream remote already configured."
   else
@@ -96,7 +85,7 @@ else
 fi
 
 # --- Step 2.7: Link-flag / BLAS guidance for local moon build / moon test ---
-# pkdx/src/nash/moon.pkg と pkdx/src/payoff/moon.pkg は `cc-link-flags` の
+# src/payoff/moon.pkg と推移依存先の vendored moon.pkg は `cc-link-flags` の
 # 既定値として macOS 向け `-framework Accelerate` を埋め込んでいる。
 # `src/main` はこれらを推移的に依存するため、Linux/Windows で
 # `moon build --target native src/main` を実行する場合もリンク失敗を避ける
@@ -181,15 +170,15 @@ esac
 # --- Step 3: pkdx binary ---
 echo "[3/5] Downloading pkdx binary ($BINARY_NAME)..."
 
-LOCAL_BUILD="$REPO_ROOT/pkdx/_build/native/release/build/src/main/main.exe"
-LOCAL_BUILD_DEBUG="$REPO_ROOT/pkdx/_build/native/debug/build/src/main/main.exe"
+LOCAL_BUILD="$REPO_ROOT/_build/native/release/build/src/main/main.exe"
+LOCAL_BUILD_DEBUG="$REPO_ROOT/_build/native/debug/build/src/main/main.exe"
 
 # Detect stale local build: if any source file is newer than the binary, it's outdated
 is_build_stale() {
   local bin="$1"
   [ ! -f "$bin" ] && return 1
   local newest_src
-  newest_src=$(find "$REPO_ROOT/pkdx/src" -name '*.mbt' -newer "$bin" -print -quit 2>/dev/null)
+  newest_src=$(find "$REPO_ROOT/src" -name '*.mbt' -newer "$bin" -print -quit 2>/dev/null)
   [ -n "$newest_src" ]
 }
 
@@ -235,7 +224,7 @@ if [ "$NEED_DOWNLOAD" = true ]; then
       echo "  Downloaded to $BINARY"
     else
       echo "  Warning: No release found. You can build locally instead:"
-      echo "    cd pkdx && moon build --target native"
+      echo "    moon build --target native"
       echo "  (requires MoonBit toolchain: curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash)"
     fi
   }
