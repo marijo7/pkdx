@@ -26,14 +26,16 @@ pkdx damage "メガガルーラ" "ハピナス" "すてみタックル" \
 ### ばけのかわ (Disguise)
 
 - **発動条件**: 防御側特性 `ばけのかわ` かつ `--disguise-active` (`disguise_active: true`)
-- **挙動**: 初撃として全 damages を 0 で返し、状態遷移を示すフラグを立てる (`damage/engine.mbt:441-443`, `560-580`)
+- **挙動**: 通常のダメージ計算結果に「ばけのかわ消費 chip = 防御側 HP / 8 (整数床)」を 16 段階の各ロールに加算して返す。これにより `damages[]` は「ばけのかわが剥がれる際の chip + 実際の技ダメージ」を一発で表す合算値になる (`damage/engine.mbt` の variants ループ末尾)
 - **JSON 出力**:
-  - `damages: [0]×16`, `percents: [0.0]×16`
-  - `disguise_blocked: true`
-  - `ko_text: "けがわブロック"`
-  - `is_immune: false` (**免疫ではない** ─ 1/8 HP チップは呼び出し側責任)
-  - `hits_dealt: 0`
+  - `damages[i] = base_damage[i] + chip` (chip = `def_hp / 8`)
+  - `disguise_blocked: true` (chip 加算済みフラグ)
+  - `disguise_chip: <chip 値>` (内訳)
+  - `ko_text` は加算後の値で再計算
+  - `is_immune: false`
+  - `hits_dealt`: 通常通り技の hit 数 (chip は ability proc であり hit ではない)
 - **2 撃目以降**: `--disguise-active` を外して再計算 (エンジンは状態を持たない)
+- **非 ばけのかわ防御側**: `--disguise-active` 指定でも chip は加算されない (通常ダメージ)
 
 ### てんねん (Unaware)
 
@@ -76,6 +78,58 @@ pkdx damage "メガガルーラ" "ハピナス" "すてみタックル" \
 - **Wonder Room**: 上記すべて **未対応** (`WONDER_ROOM_NOT_SUPPORTED` コメント多数)。シングル前提で設計されているため、Wonder Room 下の Def/SpD 入れ替えは考慮していない
 - **ボディプレス時の `--atk-rank`**: B ランクを渡す (攻撃ランクではなく防御ランク)。SKILL.md 側でもユーザーに注記する
 
+### 反射技 (カウンター / ミラーコート / メタルバースト / ほうふく)
+
+| 技 | 倍率 | 反射対象 | タイプ | 優先度 | タイプ無効 |
+|---|---|---|---|---|---|
+| カウンター | 2.0 | 物理のみ | かくとう | -5 | ゴースト |
+| ミラーコート | 2.0 | 特殊のみ | エスパー | -5 | あく |
+| メタルバースト | 1.5 | 物理 + 特殊 | はがね | 0 (後攻時) | (なし) |
+| ほうふく | 1.5 | 物理 + 特殊 | あく | 0 (後攻時) | (なし) |
+
+通常の威力ベース計算 (`base_power → effective_power → 16-roll`) は **走らない**。
+受けたダメージ × 倍率の固定計算 + 反射技自身のタイプ無効判定のみ適用される。
+急所・乱数は仕様上なしだが、CLI 出力では Step1 の 16 段乱数に倍率を乗算した
+配列を `damages[]` に返すので、相手側の乱数幅を継承した結果になる。
+
+**CLI 例**:
+
+```bash
+# 必須フラグ (両方欠損なら反射技指定はエラー、非反射技に --incoming-* 指定もエラー)
+bin/pkdx damage <reflect_user> <reflected_target> <反射技> \
+  --incoming-attacker <reflected_target> \
+  --incoming-move <相手の技> \
+  --format json
+
+# Incoming 側の補正フラグ群 (全て任意、外側 --atk-* と対称)
+#   --incoming-atk-ability    特性 (もうか / すなのちから / いかく ...)
+#   --incoming-atk-item       持ち物 (こだわりハチマキ / いのちのたま / とつげきチョッキ ...)
+#   --incoming-atk-nature     性格 (いじっぱり / ようき / ひかえめ ...)
+#   --incoming-atk-rank       攻撃ランク段 (-6..+6)
+#   --incoming-atk-stat       攻撃stat実数値 override
+#   --incoming-atk-status     状態異常 (burn 等)
+#   --incoming-atk-rank-up-count  ランク上昇累計 (アシストパワー用)
+#   --incoming-atk-hp         HP 比 (やけっぱち用、例 1/2)
+#   --incoming-tera-type      テラスタイプ
+#   --incoming-critical       急所だった場合
+```
+
+- 反射ダメージは「相手 = `--incoming-attacker`」に与える。JSON の `defender_hp`
+  は反射先の HP (`--def-hp` override 適用後)。
+- JSON の `input.reflect` には `kind` / `multiplier_num,den` / incoming 側の
+  全 modifier を echo する (反射技以外では完全に省略され、既存 JSON 形状と互換)。
+- 反射する側の **防御コンテキスト** (外側 `--atk-ability` / `--atk-item` /
+  `--atk-rank` / `--atk-status` / `--atk-nature`) は Step1 の defender 側に
+  そのまま流れる。例: `ハピナス カウンター --atk-ability マルチスケイル` で
+  ハピナスの HP 満タン時にマルチスケイル軽減を反映できる。
+
+**Nash 側の制約**: `payoff/switching_game.mbt` の反射評価は「相手の物理/特殊技
+の平均ダメージ × 反射倍率 × p_slow × p_hit」で行う。メタルバースト / ほうふく
+は base speed 比較で「明らかに先制する場合は 0」とし、相手の優先度技に対しては
+p_slow=1 で必ず反射が成立する扱い。speed rank・スカーフ等の補正は payoff 経路
+では未反映 (compute_damage_variants が speed rank を伝播していないため)。CLI
+の damage では incoming-* で全補正反映できる。
+
 ### ウェザーボール
 
 - **タイプ変化**: 晴 → ほのお / 雨 → みず / 砂 → いわ / 雪 → こおり (`damage/variable_power.mbt:20-35`)
@@ -114,7 +168,106 @@ pkdx damage "サザンドラ" "ハピナス" "はたきおとす" --def-item-rem
 
 ---
 
-## 3. 壁 (Reflect / Light Screen / Aurora Veil)
+## 3. 天候 (Weather)
+
+### `--weather` フラグの値域
+
+CLI は **日本語名のみ** を受け取る (`src/main/main.mbt:1266`、`src/model/weather.mbt:13-21`)。未指定または不明な文字列は `Weather::None` に落ちる。
+
+| `--weather` 値 | enum | 備考 |
+|----------------|------|------|
+| 省略 / 空文字 / それ以外 | `None` | 天候なし。`is_active() == false` |
+| `はれ` | `Sun` | 「ひでり」「日本晴れ」等のエイリアスは **無い** |
+| `あめ` | `Rain` | 「あめふらし」等のエイリアスは **無い** |
+| `すなあらし` | `Sand` | 略称 (`すな` 等) は不可 |
+| `ゆき` | `Snow` | 第 9 世代以降の「ゆき」。旧「あられ」表記は受理されない |
+
+英語値 (`sun` / `rain` / `sand` / `snow`) や旧表記 (`あられ`) は **受け付けない**。Phase 2 のユーザー入力正規化はスキル側 (SKILL.md Phase 1-2) が担当する。
+
+### 天候が効く 3 ヶ所
+
+1. **技ダメージ乗数** (`damage/weather_field.mbt:3-14`、`damage/engine.mbt:364-368`)
+   - `はれ` × ほのお技: `6144/4096 = 1.5x`
+   - `はれ` × みず技: `2048/4096 = 0.5x`
+   - `あめ` × みず技: `1.5x`
+   - `あめ` × ほのお技: `0.5x`
+   - `すなあらし` / `ゆき` には技タイプ別の威力補正は **無い** (ステ補正のみ)
+2. **防御側ステータス補正** (`damage/weather_field.mbt:18-44`、`damage/engine.mbt:229-230`)
+   - `すなあらし`: 防御側が **いわタイプ** かつ **特殊技** を受けるとき SpD ×1.5
+   - `ゆき`: 防御側が **こおりタイプ** かつ **物理技** を受けるとき Def ×1.5
+   - rank/性格/特性/道具補正の **後** に乗る (`engine.mbt:204-230` の順序コメント参照)
+   - ボディプレス時は **攻撃側自身の Def** が攻撃値になるため、攻撃側がいわ/こおりタイプなら同じロジックで `atk_stat` 側に反映される (`engine.mbt:193-200`)
+3. **天候依存特性** ─ 後述 3-2 節
+
+### 3-2. 天候依存特性
+
+`damage/abilities.mbt` 内で `weather` enum を直接参照する分岐。`--atk-ability` / `--def-ability` を渡さない限り **発動しない**。
+
+| 特性 | 発動条件 | 効果 | 実装 |
+|------|----------|------|------|
+| サンパワー | `はれ` かつ 特殊技 | 攻撃側 SpA ×1.5 | `abilities.mbt:18-23` |
+| こだいかっせい | `はれ` (技分類問わず) | 攻撃側 atk_stat ×1.3 (`13/10`) | `abilities.mbt:24-29` |
+| ひひいろのこどう | `はれ` かつ 物理技 | 攻撃側 Atk ×`5461/4096` ≈ 1.333x | `abilities.mbt:36-41` |
+| すなのちから | `すなあらし` かつ 技タイプが `いわ` / `じめん` / `はがね` | 威力 ×1.3 (`13/10`) | `abilities.mbt:148-158` |
+
+- **クォークチャージ** / **ハドロンエンジン** は天候ではなく **エレキフィールド** 駆動 (`abilities.mbt:30-35`, `42-47`)。`--field エレキフィールド` で発動する
+- **こだいかっせい / クォークチャージ**: pkdx は「最大ステの自動選択」をしない。`atk_stat` 側にしか乗らない実装になっているので、防御側のブースト効果 (本家では防御ステが最高の場合 D/B ×1.3) は **未対応**
+
+### 3-3. 天候発生特性は自動発動しない
+
+ひでり / ひざしがつよい / あめふらし / すなおこし / ゆきふらし / オーロベール 等の **天候を呼ぶ特性** は `pkdx damage` 内では一切自動発動しない。`--atk-ability ひでり` 等を渡しても天候は `None` のまま計算される。
+
+天候下で計算したい場合は **必ず `--weather` を明示的に指定** する。逆に「天候特性は持っているが交代直後で発動前」のシナリオも `--weather` を省略するだけで再現できる。
+
+### 3-4. ウェザーボール
+
+タイプと威力を天候で書き換える唯一の技 (`damage/variable_power.mbt:21-43`)。**Section 2 の同名項目を参照**。要点だけ再掲:
+
+- `Weather::None` → 35 / ノーマル、`Sun` → 100 / ほのお、`Rain` → 100 / みず、`Sand` → 100 / いわ、`Snow` → 100 / こおり
+- タイプ解決はフェアリースキン等の **Skin 系特性より前** に走る
+
+### 3-5. CLI 例
+
+```bash
+# はれ下のフレアドライブ (ほのお技 1.5x)
+pkdx damage "リザードン" "ハピナス" "フレアドライブ" --weather はれ
+
+# あめ下のハイドロポンプ (みず技 1.5x) + すいすい想定の素早さは別途
+pkdx damage "カイオーガ" "グラードン" "ハイドロポンプ" --weather あめ
+
+# すなあらし下、防御側いわタイプの SpD ×1.5 (特殊技を受ける場合のみ)
+pkdx damage "ゲンガー" "バンギラス" "シャドーボール" --weather すなあらし
+# → バンギラスのいわタイプ補正で SpD が 1.5x される
+
+# ゆき下、防御側こおりタイプの Def ×1.5 (物理技を受ける場合のみ)
+pkdx damage "ガブリアス" "パルシェン" "じしん" --weather ゆき
+
+# 天候依存特性は --weather と --atk-ability の両方が必要
+pkdx damage "リザードン" "ハピナス" "オーバーヒート" \
+  --weather はれ --atk-ability サンパワー
+# → SpA ×1.5 + ほのお技ダメ ×1.5 が独立に乗る
+
+# こだいかっせい (はれ起動)
+pkdx damage "トドロクツキ" "ハピナス" "じゃれつく" \
+  --weather はれ --atk-ability こだいかっせい
+# → Atk ×1.3 (技分類問わず atk_stat 側にのみ乗る)
+
+# すなのちから (すなあらし起動、いわ/じめん/はがね 技のみ)
+pkdx damage "ガブリアス" "ハピナス" "じしん" \
+  --weather すなあらし --atk-ability すなのちから
+# → 威力 ×1.3
+```
+
+### 3-6. 未対応 / 注意
+
+- **天候ターン数の概念は無し**: pkdx damage は単発の状態を計算するだけで、5/8 ターンの残量や「天候石」効果は扱わない
+- **エアロック / ノーてんき**: 天候を打ち消す特性は **未対応**。`--weather` を渡せばそのまま乗る
+- **やどりぎのタネ / どくびし** 等の field hazard、`おいかぜ` 等の side condition は damage 計算には現れない (素早さ調整は SKILL.md 側で扱う)
+- **`こだいかっせい` / `クォークチャージ` の最高ステ自動判定**: 未実装。`atk_stat` 側にしか乗らないため、本家で D/B がブーストされるケースは `--def-ability` 経由でも再現できない。代替として `--def-stat` で実数値を 1.3 倍した値を渡すのが現状のワークアラウンド
+
+---
+
+## 4. 壁 (Reflect / Light Screen / Aurora Veil)
 
 ### 適用ペア
 
@@ -158,7 +311,7 @@ pkdx damage "ローブシン" "ハピナス" "かわらわり" \
 
 ---
 
-## 4. 連続技 (Multi-hit)
+## 5. 連続技 (Multi-hit)
 
 ### 技の分類 (`damage/multi_hit.mbt`)
 
@@ -242,7 +395,7 @@ pkdx damage "イッカネズミ" "ピカチュウ" "ネズミざん" --version s
 
 ---
 
-## 5. 状態異常 (Status Condition)
+## 6. 状態異常 (Status Condition)
 
 ### パーサ値域 (`damage/status_condition.mbt:82-93`, `model/status_condition.mbt`)
 
@@ -271,7 +424,7 @@ pkdx damage "イッカネズミ" "ピカチュウ" "ネズミざん" --version s
 
 ---
 
-## 6. 急所 (Critical Hit)
+## 7. 急所 (Critical Hit)
 
 ### ランク無視ルール (`damage/stat_resolution.mbt:143-146`)
 
@@ -299,7 +452,7 @@ pkdx damage "イッカネズミ" "ピカチュウ" "ネズミざん" --version s
 
 ---
 
-## 7. JSON 出力フィールド一覧
+## 8. JSON 出力フィールド一覧
 
 `model/calc_result.mbt` 参照。
 
@@ -312,12 +465,48 @@ pkdx damage "イッカネズミ" "ピカチュウ" "ネズミざん" --version s
 | `ko` / `ko_text` | `String` | 確定数テキスト (`"確定1発"` / `"乱数1発(X/16)"` / `"確定2発"` ...) |
 | `defender_hp` | `Int` | 防御側 HP 実数値 |
 | `is_immune` | `Bool` | タイプ相性 0 / 特性無効時 `true`。**ばけのかわの場合は `false`** |
-| `disguise_blocked` | `Bool` | ばけのかわで初撃が通らなかった時 `true` |
-| `hits_dealt` | `Int` | 実際の命中回数 (免疫時 1、Disguise 時 0、ParentalBond 時 2) |
+| `disguise_blocked` | `Bool` | ばけのかわ chip が `damages` に加算された時 `true` |
+| `disguise_chip` | `Int` | 加算された chip 値 (`def_hp / 8`、整数床)。0 なら未加算 |
+| `hits_dealt` | `Int` | 技の hit 数 (免疫時 1、Disguise 時も技の hit 数を保持、ParentalBond 時 2) |
+| `input` | `Object` | ダメ計に実際に渡した入力一式の echo (`cli/format.mbt` の `damage_input_to_json`)。下記 8.1 参照 |
+
+### 8.1 `input` フィールド
+
+LLM が `damages` / `percents` / `ko` だけを読んで前提を取り違えるのを防ぐため、エンジンに渡した `DamageCalcInput` を echo back する。Phase 3 の条件テーブルは **必ずここから引く**。エンジンは出力したそのままで計算しているため、`input.*` と乖離した値をユーザーへ提示してはならない。
+
+| パス | 型 | 意味 |
+|------|-----|------|
+| `input.attacker.name` / `defender.name` | `String` | DB から正規化された jpn 名 |
+| `input.attacker.types` / `defender.types` | `String[]` | 1 or 2 要素 (フォーム判別の根拠) |
+| `input.attacker.base_stats` / `defender.base_stats` | `{hp, atk, def, spa, spd, spe: Int}` | フォーム別の種族値 |
+| `input.attacker.ability` / `defender.ability` | `String` | 空文字 = 指定なし |
+| `input.attacker.item` / `defender.item` | `String` | 空文字 = 持ち物なし |
+| `input.attacker.nature` / `defender.nature` | `String` | 空文字 = 攻撃側「特化相当 +10%」/ 防御側「無補正」のデフォルト |
+| `input.attacker.rank` / `defender.rank` | `Int` | -6..+6 |
+| `input.attacker.stat_override` / `defender.stat_override` | `Int` | `0` = 未指定。非 0 ならユーザー指定の rank 前実数値 |
+| `input.defender.hp_override` | `Int` | `0` = 未指定。非 0 ならユーザー指定の HP 実数値 |
+| `input.attacker.status` / `defender.status` | `String` | `"none"`/`"paralyze"`/`"burn"`/`"poison"`/`"badpoison"`/`"sleep"`/`"drowsy"` |
+| `input.attacker.rank_up_count` / `defender.rank_up_count` | `Int` | アシストパワー / つけあがる用 |
+| `input.attacker.hp_num` / `hp_den` | `Int` | 攻撃側 HP 比 (やけっぱち)。デフォルトは `2/2` (満タン) |
+| `input.defender.item_removable` | `Bool` | はたきおとす倍率 (1.5x) 判定 |
+| `input.move.name` / `type` / `category` / `power` / `accuracy` | `String` / `Int` | DB から引いた技情報 |
+| `input.tera_type` | `String` | 空文字 = テラスタル無し |
+| `input.weather` | `String` | `"none"` / `"はれ"` / `"あめ"` / `"すなあらし"` / `"ゆき"` |
+| `input.field` | `String` | `"none"` / `"エレキ"` / `"グラス"` / `"サイコ"` / `"ミスト"` |
+| `input.critical` | `Bool` | 急所 |
+| `input.wall` | `String` | `"none"` / `"reflect"` / `"light-screen"` / `"aurora-veil"` |
+| `input.screen_pierce` | `Bool` | 壁貫通 move |
+| `input.fainted_count` | `Int` | そうだいしょう / おはかまいり 用 |
+| `input.is_double` | `Bool` | ダブル (spread 0.75x) |
+| `input.stat_system` | `String` | `"champions"` / `"standard"` |
+| `input.multi_hit_mode` | `String` | `"auto"` / `"fixed:N"` (1..5) / `"expected"` (damage CLI では発生しない) |
+| `input.disguise_active` | `Bool` | ばけのかわ初撃ガード |
+
+`status` は counter 値 (`BadPoison(n)` / `Sleep(n)` / `Drowsy(n)`) を握り潰して種別だけ返す。これはダメ計が counter に依存しない (たたりめ / からげんき判定は「ステータス異常がついているか」だけで足りる) ためで、ターン経過を追跡したい場合は payoff 層へ。
 
 ---
 
-## 8. 未実装・注意点
+## 9. 未実装・注意点
 
 ### 未実装
 
@@ -333,7 +522,7 @@ pkdx damage "イッカネズミ" "ピカチュウ" "ネズミざん" --version s
 
 ---
 
-## 9. 4096 ベースの乗数表 (参考)
+## 10. 4096 ベースの乗数表 (参考)
 
 Showdown 準拠の整数乗算ベース。`round5(dmg, m) = (dmg × m + 2048) / 4096` の丸め規則。
 

@@ -47,11 +47,13 @@ test "e2e: weather ball in sun becomes fire type power 100" {
   let mv = mk_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = mk_damage_input(atk, dfn, mv, weather=@model.Weather::Sun)
   let r = calc_damage(inp)
-  inspect(r.is_immune, content="false")
-  inspect(r.hits_dealt, content="1")
-  inspect(r.min_damage, content="114")
-  inspect(r.max_damage, content="135")
-  inspect(r.ko_text, content="確定2発")
+  assert_true(!(r.is_immune))
+  @debug.debug_inspect(r.hits_dealt, content="1")
+  @debug.debug_inspect(r.min_damage, content="114")
+  @debug.debug_inspect(r.max_damage, content="135")
+  @debug.debug_inspect(r.ko_text, content=(
+    #|"確定2発"
+  ))
 }
 
 ///|
@@ -66,7 +68,7 @@ test "e2e: reflect halves physical damage" {
   // Reflect cuts roughly in half (integer rounding keeps it just below 2x).
   assert_true(r_wall.max_damage * 2 <= r_no.max_damage + 1)
   assert_true(r_wall.max_damage * 2 >= r_no.max_damage - 2)
-  inspect(r_wall.hits_dealt, content="1")
+  @debug.debug_inspect(r_wall.hits_dealt, content="1")
 }
 
 ///|
@@ -118,19 +120,26 @@ test "e2e: lash out doubles at half HP" {
 }
 
 ///|
-test "e2e: disguise initial hit blocks all damage and flags disguise_blocked" {
+test "e2e: disguise active adds 1/8 chip on top of normal damage" {
   let atk = e2e_pokemon("d-atk", "ノーマル", 100, 130, 80, 80, 80, 80)
   let dfn = e2e_pokemon("mimikyu", "ノーマル", 100, 80, 80, 80, 80, 80)
   let mv = mk_move("たいあたり", "ノーマル", @model.Physical, 40)
-  let inp = mk_damage_input(
+  let inp_active = mk_damage_input(
     atk, dfn, mv, def_ability="ばけのかわ", disguise_active=true,
   )
-  let r = calc_damage(inp)
-  inspect(r.disguise_blocked, content="true")
-  inspect(r.max_damage, content="0")
-  inspect(r.hits_dealt, content="0")
-  inspect(r.ko_text, content="けがわブロック")
-  inspect(r.is_immune, content="false")
+  let inp_inactive = mk_damage_input(
+    atk, dfn, mv, def_ability="ばけのかわ", disguise_active=false,
+  )
+  let r_active = calc_damage(inp_active)
+  let r_inactive = calc_damage(inp_inactive)
+  let chip = r_inactive.defender_hp / 8
+  assert_true(r_active.disguise_blocked)
+  assert_true(r_active.disguise_chip == chip)
+  assert_true(r_active.max_damage == r_inactive.max_damage + chip)
+  assert_true(r_active.min_damage == r_inactive.min_damage + chip)
+  // hits_dealt は move 視点の hit 数 (chip は ability proc で hit ではない)
+  assert_true(r_active.hits_dealt == r_inactive.hits_dealt)
+  assert_true(!(r_active.is_immune))
 }
 
 ///|
@@ -188,6 +197,6 @@ test "e2e: hex doubles on statused defender" {
   // test in variable_power_wbtest covers that), but the type chart wins.
   // → A proper hex e2e lives above in the unit test; here we just verify
   // the immune branch is stable.
-  inspect(r_none.is_immune, content="true")
-  inspect(r_burn.is_immune, content="true")
+  assert_true(r_none.is_immune)
+  assert_true(r_burn.is_immune)
 }

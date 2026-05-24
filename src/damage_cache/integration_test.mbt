@@ -56,6 +56,19 @@ fn int_baseline() -> CacheKeyInput {
     def_item_removable: false,
     multi_hit_mode: "",
     disguise_active: false,
+    incoming_attacker: "",
+    incoming_move: "",
+    incoming_atk_ability: "",
+    incoming_atk_item: "",
+    incoming_atk_nature: "",
+    incoming_atk_rank: 0,
+    incoming_atk_stat: 0,
+    incoming_atk_status: "",
+    incoming_atk_rank_up_count: 0,
+    incoming_atk_hp_num: 0,
+    incoming_atk_hp_den: 0,
+    incoming_tera_type: "",
+    incoming_critical: false,
   }
 }
 
@@ -82,7 +95,7 @@ test "integration: build_cache_key + persistent_cache round-trip" {
   close(cache2)
   int_cleanup(path)
   match got {
-    Some(s) => assert_eq(s, sample_json)
+    Some(s) => @debug.assert_eq(s, sample_json)
     None => fail("entry not persisted across close/reopen")
   }
 }
@@ -108,8 +121,8 @@ test "integration: two distinct inputs produce two distinct cache entries" {
   int_cleanup(path)
   match (va, vb) {
     (Some(sa), Some(sb)) => {
-      assert_eq(sa, "{\"rank\":0}")
-      assert_eq(sb, "{\"rank\":2}")
+      @debug.assert_eq(sa, "{\"rank\":0}")
+      @debug.assert_eq(sb, "{\"rank\":2}")
     }
     _ => fail("one of the entries is missing")
   }

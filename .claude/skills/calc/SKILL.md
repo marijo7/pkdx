@@ -163,7 +163,7 @@ $PKDX damage "<攻撃側名>" "<防御側名>" "<技名>" \
 | `--atk-hp <ratio>` | 攻撃側残 HP 比率 | `1/2`, `50%`, `1/3`, `33%` ... | やけっぱち (HP ≤ 1/2 で威力 2x) |
 | `--def-item-removable` | 防御側が奪える持ち物を持つ | bool flag | はたきおとす威力 = 65 × 1.5 = 97 |
 | `--multi-hit <mode>` | 連続技の回数固定 | `auto` (既定, DB 参照), `1..5` (固定) | 連続技の検証・Skill Link 再現 |
-| `--disguise-active` | ばけのかわが剥がれる前 | bool flag | 初撃ダメージ 0 + `ko="けがわブロック"` + `hits_dealt=0`（`damages[]` は全 0） |
+| `--disguise-active` | ばけのかわが剥がれる前 | bool flag | 通常ダメージに 1/8 HP chip を加算した `damages[]` を返す (`disguise_blocked=true`, `disguise_chip=def_hp/8`)。「ばけのかわ消費 + 実ダメージ」を 1 つの数で扱う |
 
 ### 典型的な使用例
 
@@ -220,15 +220,78 @@ $PKDX damage "ドリュウズ" "ナットレイ" "ロックブラスト" \
   "min": min_damage,
   "max": max_damage,
   "defender_hp": hp,
-  "ko": "確定数テキスト"
+  "hits_dealt": n,
+  "ko": "確定数テキスト",
+  "disguise_blocked": false,   // true なら damages に ばけのかわ chip が加算済み
+  "disguise_chip": 0,          // ばけのかわ消費時の固定 1/8 HP chip。0 なら未加算
+  "variants": [...],
+  "input": {
+    "attacker": {
+      "name": "...",
+      "types": ["type1", "type2"],
+      "base_stats": {"hp": n, "atk": n, "def": n, "spa": n, "spd": n, "spe": n},
+      "ability": "",          // 空文字 = 指定なし
+      "item": "",
+      "nature": "",           // 空文字 = 攻撃ステ特化相当 (+10%) を自動適用
+      "rank": 0,
+      "stat_override": 0,     // 0 = 未指定 (engine がデフォルトの実数値を計算)
+      "status": "none",       // none / paralyze / burn / poison / badpoison / sleep / drowsy
+      "rank_up_count": 0,
+      "hp_num": 2, "hp_den": 2  // 攻撃側 HP 比 (やけっぱち用)、満タン = 2/2
+    },
+    "defender": {
+      "name": "...",
+      "types": [...],
+      "base_stats": {...},
+      "ability": "", "item": "", "nature": "",  // 防御側 nature 空文字 = 無補正
+      "rank": 0,
+      "stat_override": 0,
+      "hp_override": 0,
+      "status": "none",
+      "rank_up_count": 0,
+      "item_removable": false
+    },
+    "move": {"name": "...", "type": "...", "category": "物理|特殊|変化", "power": n, "accuracy": n},
+    "tera_type": "",          // 空文字 = テラスタルなし
+    "weather": "none",        // none / はれ / あめ / すなあらし / ゆき
+    "field": "none",          // none / エレキ / グラス / サイコ / ミスト
+    "critical": false,
+    "wall": "none",           // none / reflect / light-screen / aurora-veil
+    "screen_pierce": false,
+    "fainted_count": 2,
+    "is_double": false,
+    "stat_system": "champions",  // champions / standard
+    "multi_hit_mode": "auto",    // auto / fixed:N / expected
+    "disguise_active": false
+  }
 }
 ```
+
+**重要**: `input` フィールドは pkdx がダメ計に実際に使用した条件を echo back する。Phase 3 のテーブル整形では **必ず `input.*` の値を引用**し、ユーザーへの問い合わせや AskUserQuestion で得た値を再現してはならない (typo や型違いで乖離する場合がある)。
+
+`input.*` の意味:
+- 文字列フィールドの空文字 (`""`) は「未指定」を意味する。攻撃側 `nature: ""` は engine が「攻撃ステ特化相当 +10%」を自動適用、防御側 `nature: ""` は「無補正」。
+- `stat_override`/`hp_override` の `0` は「未指定 (engine が SP/EV/性格からデフォルト実数値を計算)」。非 0 ならユーザーが渡した rank 前の実数値そのもの。
+- `weather`/`field` は `"none"` か canonical な JP 名 (はれ/あめ/...）。
+- `status` は canonical な英語短縮形 (`burn`/`paralyze`/...). counter 値 (BadPoison(n)/Sleep(n)/Drowsy(n)) は表現せず、種別のみ返す。
+- `multi_hit_mode` は `"auto"` (DB 参照), `"fixed:N"` (1..5), `"expected"` (payoff 専用、damage CLI では発生しない)。
 
 ---
 
 ## Phase 3: 結果出力
 
 スクリプト出力を以下のMarkdownテーブルに整形して提示する。
+
+**フィードバック前提**: 条件テーブルの値は **すべて `input.*` フィールドから引く**。`damages`/`percents`/`ko` だけを読んで「攻撃側は〇〇特化のはず」「天候ははれだったはず」と推論で補完してはならない (LLM が前提を取り違える典型箇所)。
+
+- 攻撃側名・タイプは `input.attacker.name` / `input.attacker.types`
+- 攻撃側 特性 / 持ち物 / 性格 / ランクは `input.attacker.ability` / `.item` / `.nature` / `.rank`
+- 防御側も同様に `input.defender.*` から引く
+- 技名・タイプ・分類・威力は `input.move.*`
+- 天候 / フィールド / テラスタル / 急所 / 壁は `input.weather` / `.field` / `.tera_type` / `.critical` / `.wall`
+- 連続技回数は `input.multi_hit_mode` (`"fixed:N"` なら N 回固定、`"auto"` なら DB 解決) と `hits_dealt` を併記
+
+空文字 (`""`) や `"none"` の項目は条件テーブル行ごと省略してよい。
 
 ```markdown
 ## ダメージ計算結果
@@ -272,7 +335,7 @@ $PKDX damage "ドリュウズ" "ナットレイ" "ロックブラスト" \
 ダメージが 0 になるケースでは 16 段階乱数表を省略し、確定数行を **無効化の理由** に置き換える。条件テーブルの「タイプ相性」欄には実効倍率を記す。
 
 - **タイプ相性 / 特性で無効** (`ko: "immune"` 相当): `Immune (0 damage)` 平文のため JSON フィールドが取れないことに留意。乱数表行は「**ダメージは発生しない（タイプ相性または特性により無効）**」と一行で済ませ、確定数欄は **「無効（ダメージ0）」** とする
-- **ばけのかわブロック** (`ko: "けがわブロック"`): 乱数表行は「**ばけのかわで初撃が無効化されたため省略（全 0）**」、確定数欄は **「ばけのかわブロック (`ko="けがわブロック"`, `hits_dealt=0`)」**。次回以降は `--disguise-active` を外して再計算する旨を案内する
+- **ばけのかわ加算** (`disguise_blocked: true`): `damages[]` には 1/8 HP chip が **既に加算済み**。条件テーブル下に「ばけのかわ chip: `disguise_chip` HP (各乱数値に加算済み)」の一行を添えて、ユーザーが「実ダメージ + 消費 chip の合算値」と認識できるようにする。乱数表・確定数はそのまま通常通り表示する
 
 ---
 

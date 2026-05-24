@@ -89,6 +89,7 @@ fn epb_input(
     def_item_removable: false,
     multi_hit_mode: @model.MultiHit::Auto,
     disguise_active: false,
+    incoming: None,
   }
 }
 
@@ -104,7 +105,7 @@ test "PopulationBomb (ネズミざん) damage engine: 10 variants with hits_coun
   let dfn = epb_pokemon("defender")
   let mv = epb_move("ネズミざん")
   let r = calc_damage(epb_input(atk, dfn, mv))
-  inspect(r.variants.length(), content="10")
+  @debug.debug_inspect(r.variants.length(), content="10")
   for i = 0; i < 10; i = i + 1 {
     let v = r.variants[i]
     assert_true(v.hits_count == i + 1)
@@ -135,7 +136,7 @@ test "Triple Axel damage engine: 3 variants — unchanged after PopulationBomb a
   let dfn = epb_pokemon("defender")
   let mv = epb_move("トリプルアクセル")
   let r = calc_damage(epb_input(atk, dfn, mv))
-  inspect(r.variants.length(), content="3")
+  @debug.debug_inspect(r.variants.length(), content="3")
   assert_true(epb_approx(r.variants[0].probability, 0.10, 1.0e-12))
   assert_true(epb_approx(r.variants[1].probability, 0.09, 1.0e-12))
   assert_true(epb_approx(r.variants[2].probability, 0.81, 1.0e-12))

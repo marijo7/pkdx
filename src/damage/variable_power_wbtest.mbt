@@ -101,6 +101,7 @@ fn vp_input(
     def_item_removable,
     multi_hit_mode: @model.MultiHit::Auto,
     disguise_active: false,
+    incoming: None,
   }
 }
 
@@ -111,8 +112,10 @@ test "weather ball: no weather keeps normal 50" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"))
   let (p, t) = resolve_move_type_override(mv, inp)
-  inspect(p, content="50")
-  inspect(t, content="ノーマル")
+  @debug.debug_inspect(p, content="50")
+  @debug.debug_inspect(t, content=(
+    #|"ノーマル"
+  ))
 }
 
 ///|
@@ -120,8 +123,10 @@ test "weather ball: sun promotes to 100 fire" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Sun)
   let (p, t) = resolve_move_type_override(mv, inp)
-  inspect(p, content="100")
-  inspect(t, content="ほのお")
+  @debug.debug_inspect(p, content="100")
+  @debug.debug_inspect(t, content=(
+    #|"ほのお"
+  ))
 }
 
 ///|
@@ -129,7 +134,9 @@ test "weather ball: rain promotes to 100 water" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Rain)
   let (_, t) = resolve_move_type_override(mv, inp)
-  inspect(t, content="みず")
+  @debug.debug_inspect(t, content=(
+    #|"みず"
+  ))
 }
 
 ///|
@@ -137,7 +144,9 @@ test "weather ball: sand promotes to 100 rock" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Sand)
   let (_, t) = resolve_move_type_override(mv, inp)
-  inspect(t, content="いわ")
+  @debug.debug_inspect(t, content=(
+    #|"いわ"
+  ))
 }
 
 ///|
@@ -145,7 +154,9 @@ test "weather ball: snow promotes to 100 ice" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Snow)
   let (_, t) = resolve_move_type_override(mv, inp)
-  inspect(t, content="こおり")
+  @debug.debug_inspect(t, content=(
+    #|"こおり"
+  ))
 }
 
 ///|
@@ -153,8 +164,10 @@ test "move type override: unrelated move passes through" {
   let mv = vp_move("たいあたり", "ノーマル", @model.Physical, 40)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Sun)
   let (p, t) = resolve_move_type_override(mv, inp)
-  inspect(p, content="40")
-  inspect(t, content="ノーマル")
+  @debug.debug_inspect(p, content="40")
+  @debug.debug_inspect(t, content=(
+    #|"ノーマル"
+  ))
 }
 
 // ---- resolve_variable_power ----
@@ -168,7 +181,7 @@ test "stored power: +3 opponent produces 80" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="80")
+  @debug.debug_inspect(p, content="80")
 }
 
 ///|
@@ -178,7 +191,7 @@ test "stored power: zero boosts keeps base 20" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="20")
+  @debug.debug_inspect(p, content="20")
 }
 
 ///|
@@ -190,7 +203,7 @@ test "assist power: +6 self produces 140" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="140")
+  @debug.debug_inspect(p, content="140")
 }
 
 ///|
@@ -202,7 +215,7 @@ test "assist power: clamps at 860 for absurd boost counts" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="860")
+  @debug.debug_inspect(p, content="860")
 }
 
 ///|
@@ -215,7 +228,7 @@ test "lash out: HP at 50% exactly doubles power" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="150")
+  @debug.debug_inspect(p, content="150")
 }
 
 ///|
@@ -227,7 +240,7 @@ test "lash out: HP at 51% keeps base power" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="75")
+  @debug.debug_inspect(p, content="75")
 }
 
 ///|
@@ -243,7 +256,7 @@ test "knock off: removable item boosts to 97" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="97")
+  @debug.debug_inspect(p, content="97")
 }
 
 ///|
@@ -255,7 +268,7 @@ test "knock off: no item keeps base 65" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="65")
+  @debug.debug_inspect(p, content="65")
 }
 
 ///|
@@ -267,7 +280,7 @@ test "hex: burn defender doubles to 130" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="130")
+  @debug.debug_inspect(p, content="130")
 }
 
 ///|
@@ -277,7 +290,7 @@ test "hex: healthy defender keeps base 65" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="65")
+  @debug.debug_inspect(p, content="65")
 }
 
 ///|
@@ -290,7 +303,7 @@ test "facade: burn attacker doubles power to 140" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="140")
+  @debug.debug_inspect(p, content="140")
 }
 
 ///|
@@ -302,7 +315,7 @@ test "facade: poison attacker doubles power" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="140")
+  @debug.debug_inspect(p, content="140")
 }
 
 ///|
@@ -317,7 +330,7 @@ test "facade: badly poisoned attacker doubles power" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="140")
+  @debug.debug_inspect(p, content="140")
 }
 
 ///|
@@ -329,7 +342,7 @@ test "facade: paralyzed attacker doubles power" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="140")
+  @debug.debug_inspect(p, content="140")
 }
 
 ///|
@@ -342,7 +355,7 @@ test "facade: sleep attacker keeps base power (can't act)" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="70")
+  @debug.debug_inspect(p, content="70")
 }
 
 ///|
@@ -352,7 +365,7 @@ test "facade: healthy attacker keeps base power" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="70")
+  @debug.debug_inspect(p, content="70")
 }
 
 ///|
@@ -363,5 +376,5 @@ test "existing weight move: body slam-like pass-through when not overridden" {
   let p = resolve_variable_power(
     mv.power, mv, inp, inp.defender, inp.attacker, "", "",
   )
-  inspect(p, content="40")
+  @debug.debug_inspect(p, content="40")
 }
