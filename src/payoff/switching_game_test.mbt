@@ -42,6 +42,14 @@ test "state_is_hashable_and_distinguishes_meaningful_fields" {
     opp_item_consumed: [false, false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false, false],
+    opp_leech_seeded: [false, false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let same : SwitchingGameState = {
@@ -63,6 +71,14 @@ test "state_is_hashable_and_distinguishes_meaningful_fields" {
     opp_item_consumed: [false, false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false, false],
+    opp_leech_seeded: [false, false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let diff_active = { ..base, my_active: 1 }
@@ -108,6 +124,14 @@ test "terminal_value_all_my_fainted_returns_minus_one" {
     opp_item_consumed: [false, false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false, false],
+    opp_leech_seeded: [false, false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   match terminal_value(state, team_a, team_b, 5) {
@@ -139,6 +163,14 @@ test "terminal_value_all_opp_fainted_returns_plus_one" {
     opp_item_consumed: [false, false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false, false],
+    opp_leech_seeded: [false, false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   match terminal_value(state, team_a, team_b, 5) {
@@ -172,6 +204,14 @@ test "terminal_value_turn_limit_reached_returns_hp_ratio_in_signed_range" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 3,
   }
   match terminal_value(state, team_a, team_b, 3) {
@@ -203,6 +243,14 @@ test "terminal_value_both_alive_before_limit_returns_none" {
     opp_item_consumed: [false, false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false, false],
+    opp_leech_seeded: [false, false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   match terminal_value(state, team_a, team_b, 5) {
@@ -279,6 +327,14 @@ test "value_returns_terminal_value_for_terminal_state" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 5,
   }
   let cache : @hashmap.HashMap[SwitchingGameState, Double] = @hashmap.HashMap([])
@@ -327,6 +383,14 @@ test "value_caches_result_via_value_stats" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let cache : @hashmap.HashMap[SwitchingGameState, Double] = @hashmap.HashMap([])
@@ -417,6 +481,14 @@ test "transition_attack_vs_attack_resolves_sequentially_by_speed" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(state, UseMove(0), UseMove(0), [fast], [slow])
@@ -463,6 +535,14 @@ test "transition_attack_vs_switch_damages_newly_switched_target" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(state, UseMove(0), Switch(1), my_team, opp_team)
@@ -514,6 +594,14 @@ test "transition_switch_vs_switch_updates_actives_only_without_damage" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(state, Switch(1), Switch(1), my_team, opp_team)
@@ -676,6 +764,14 @@ test "state_ranks_distinguish_otherwise_identical_states" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let boosted = { ..base, my_ranks: [2, 0, 0, 0, 0] }
@@ -724,6 +820,14 @@ test "transition_priority_move_outpaces_faster_opponent" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(
@@ -763,6 +867,14 @@ test "transition_sword_dance_raises_attacker_rank_by_two" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(state, UseMove(0), UseMove(0), [me], [opp])
@@ -798,6 +910,14 @@ test "transition_rank_clamps_to_plus_two_after_two_sword_dances" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   state = transition(state, UseMove(0), UseMove(0), [me], [opp])
@@ -848,6 +968,14 @@ test "transition_switch_resets_active_ranks_to_zero" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(state, Switch(1), Switch(1), my_team, opp_team)
@@ -889,6 +1017,14 @@ test "transition_rank_affects_damage_sword_dance_increases_output" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let boosted : SwitchingGameState = { ..neutral, my_ranks: [2, 0, 0, 0, 0] }
@@ -1076,6 +1212,14 @@ fn mk_mega_state_1v1(
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
 }
@@ -1289,6 +1433,14 @@ test "transition_mega_vs_switch_damages_newly_switched_target" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let next = transition(state, Mega(0), Switch(1), [me], opp_team)
@@ -1358,6 +1510,14 @@ test "mega_persists_after_switch_out_and_back_in" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   // Turn 1: mega slot 0.
@@ -1572,6 +1732,14 @@ fn switching_game_winrate_no_prune(
     opp_item_consumed: Array::make(opp_team.length(), false),
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: Array::make(my_team.length(), false),
+    opp_leech_seeded: Array::make(opp_team.length(), false),
+    my_wish_turns: no_wish_pending(my_team.length()),
+    opp_wish_turns: no_wish_pending(opp_team.length()),
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let cache : @hashmap.HashMap[SwitchingGameState, Double] = @hashmap.HashMap([])
@@ -1684,6 +1852,14 @@ test "value_accepts_explicit_alpha_beta_and_matches_default" {
     opp_item_consumed: [false, false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false, false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let cache1 : @hashmap.HashMap[SwitchingGameState, Double] = @hashmap.HashMap([])
@@ -1829,6 +2005,14 @@ test "Amaeru lowers opp Atk -2 this turn, slower physical damage reduced" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let ns_amaeru = transition(state, UseMove(0), UseMove(0), [fast], [slow])
@@ -1872,6 +2056,14 @@ test "recoil 1/2 subtracts half of damage from attacker HP" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let ns = transition(state, UseMove(0), UseMove(0), [attacker], [defender])
@@ -1918,6 +2110,14 @@ test "self_ko zeroes attacker HP even when hitting Ghost (dmg=0)" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let ns = transition(state, UseMove(0), UseMove(0), [attacker], [ghost])
@@ -1960,6 +2160,14 @@ test "recharge move forces attacker skip on the turn after the hit lands" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let outs1 = attempt_turn_with_cache(
@@ -2019,6 +2227,14 @@ test "must_recharge forces attacker UseMove to skip and clears after one turn" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let outs = attempt_turn_with_cache(

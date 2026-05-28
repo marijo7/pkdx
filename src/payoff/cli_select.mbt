@@ -47,6 +47,74 @@
 /// side; for doubles the model is currently unsupported (Single only).
 
 ///|
+/// CLI JSON 経由で `Move.healing` を直接指定する path。
+///
+/// `m014` 由来の DB カラム名 (`heal_kind` / `heal_num` / `heal_den` /
+/// `heal_sunny_num` / `heal_sunny_den` / `heal_harsh_num` / `heal_harsh_den`)
+/// と同名のフィールドを optional で受ける。`heal_kind` が無ければ `None` で、
+/// 既存テスト fixture (回復技を持たない move JSON) は無改変で通る。
+///
+/// 主な用途: E2E golden test で DB 接続なしに回復技持ち team を組み立てる。
+/// 通常運用では `pkdx query` 経由で DB から読まれた値が input JSON に乗るため
+/// この path も DB と同じセマンティクスを保つ必要がある — そのため
+/// `@db.parse_healing` を共有する。
+///
+/// `heal_kind` が present かつ未知の値 (typo / legacy 名) のとき
+/// `@db.parse_healing` は `None` を返すが、ここで黙って回復技を無効化すると
+/// payoff 行列が静かに変質し、利用者は回復技を入れたつもりで非回復として
+/// 計算された結果を受け取ってしまう。select の数値は行列に直接効くので、
+/// `parse_nature_field` と同様に検出可能な入力エラーは raise して気付かせる。
+fn parse_healing_json(
+  m : Map[String, Json],
+  ctx : String,
+) -> @model.HealingEffect? raise NashCliError {
+  let kind = match m.get("heal_kind") {
+    None => ""
+    Some(String(s)) => s
+    Some(_) => raise InvalidJson(ctx + ".heal_kind must be a string")
+  }
+  if kind == "" {
+    return None
+  }
+  let n = match m.get("heal_num") {
+    Some(Number(x, ..)) => x.to_int()
+    _ => 0
+  }
+  let d = match m.get("heal_den") {
+    Some(Number(x, ..)) => x.to_int()
+    _ => 1
+  }
+  let sn = match m.get("heal_sunny_num") {
+    Some(Number(x, ..)) => x.to_int()
+    _ => 0
+  }
+  let sd = match m.get("heal_sunny_den") {
+    Some(Number(x, ..)) => x.to_int()
+    _ => 1
+  }
+  let hn = match m.get("heal_harsh_num") {
+    Some(Number(x, ..)) => x.to_int()
+    _ => 0
+  }
+  let hd = match m.get("heal_harsh_den") {
+    Some(Number(x, ..)) => x.to_int()
+    _ => 1
+  }
+  // `kind` は空文字を上で早期 return 済みなので、ここで `None` が返るのは
+  // `@db.parse_healing` が受理しない未知の heal_kind に限られる。
+  match @db.parse_healing(kind, n, d, sn, sd, hn, hd) {
+    Some(h) => Some(h)
+    None =>
+      raise InvalidJson(
+        ctx +
+        ".heal_kind: unknown healing kind \"" +
+        kind +
+        "\" (expected one of fixed / weather / drain / rest / leech_seed / pain_split / wish)",
+      )
+  }
+}
+
+///|
 fn parse_move_json(j : Json, ctx : String) -> @model.Move raise NashCliError {
   match j {
     Object(m) => {
@@ -102,6 +170,53 @@ fn parse_move_json(j : Json, ctx : String) -> @model.Move raise NashCliError {
         Some(True) => true
         _ => false
       }
+      // healing / weather_set / field_set: 通常運用では DB 経路で m014 / m015
+      // 由来の値が乗る。golden / E2E test では DB 接続なしで CLI JSON 経由で
+      // move を組み立てたいため optional 受け。値域とパーサは @db.parse_healing
+      // / parse_weather_set / parse_field_set と同一 (整合性を確保するため共有)。
+      //
+      // heal_kind と同じく、weather_set / field_set も present かつ未知の値は
+      // payoff 行列を黙って変質させるため、parse_healing_json と同じ fail-fast
+      // policy で raise する (PR #143 AI Rally suggestion)。
+      let healing = parse_healing_json(m, ctx)
+      let weather_set = match m.get("weather_set") {
+        Some(String(s)) =>
+          if s == "" {
+            None
+          } else {
+            match @db.parse_weather_set(s) {
+              Some(_) as ok => ok
+              None =>
+                raise InvalidJson(
+                  ctx +
+                  ".weather_set: unknown weather \"" +
+                  s +
+                  "\" (expected one of sun / rain / sand / snow)",
+                )
+            }
+          }
+        Some(_) => raise InvalidJson(ctx + ".weather_set must be a string")
+        None => None
+      }
+      let field_set = match m.get("field_set") {
+        Some(String(s)) =>
+          if s == "" {
+            None
+          } else {
+            match @db.parse_field_set(s) {
+              Some(_) as ok => ok
+              None =>
+                raise InvalidJson(
+                  ctx +
+                  ".field_set: unknown field \"" +
+                  s +
+                  "\" (expected one of electric / grassy / misty / psychic)",
+                )
+            }
+          }
+        Some(_) => raise InvalidJson(ctx + ".field_set must be a string")
+        None => None
+      }
       {
         name,
         type_,
@@ -117,6 +232,9 @@ fn parse_move_json(j : Json, ctx : String) -> @model.Move raise NashCliError {
         recoil_den,
         self_ko,
         recharge,
+        healing,
+        weather_set,
+        field_set,
       }
     }
     _ => raise InvalidJson(ctx + " must be an object")
@@ -326,6 +444,9 @@ fn parse_combatant_json(
             recoil_den: 1,
             self_ko: false,
             recharge: false,
+            healing: None,
+            weather_set: None,
+            field_set: None,
           })
           for i in 0..<arr.length() {
             out[i] = parse_move_json(
@@ -543,6 +664,54 @@ fn parse_format(s : String) -> BattleFormat raise NashCliError {
 }
 
 ///|
+/// Parse the optional top-level `"nash_solver_config"` object. Both `tol` and
+/// `iterations` are individually optional; missing fields fall back to
+/// `NashSolverConfig::default()`. Validates that `tol > 0` and `iterations > 0`
+/// because both feed into the iterative fallback chain.
+fn parse_nash_solver_config(
+  j : Json?,
+) -> NashSolverConfig raise NashCliError {
+  let default = NashSolverConfig::default()
+  match j {
+    None => default
+    Some(Object(m)) => {
+      let tol = match m.get("tol") {
+        None => default.tol
+        Some(Number(n, ..)) => n
+        Some(_) => raise InvalidJson("nash_solver_config.tol must be a number")
+      }
+      let iterations = match m.get("iterations") {
+        None => default.iterations
+        Some(Number(n, ..)) => {
+          let i = n.to_int()
+          // Reject fractional values (1.5 等) explicitly: to_int() は黙って
+          // 切り捨てるため、config の打ち間違いが要求より低い反復回数で
+          // fallback chain を走らせてしまう
+          if i.to_double() != n {
+            raise InvalidJson(
+              "nash_solver_config.iterations must be a positive integer",
+            )
+          }
+          i
+        }
+        Some(_) =>
+          raise InvalidJson(
+            "nash_solver_config.iterations must be a positive integer",
+          )
+      }
+      if tol <= 0.0 {
+        raise InvalidJson("nash_solver_config.tol must be > 0")
+      }
+      if iterations <= 0 {
+        raise InvalidJson("nash_solver_config.iterations must be > 0")
+      }
+      { tol, iterations }
+    }
+    Some(_) => raise InvalidJson("nash_solver_config must be an object")
+  }
+}
+
+///|
 /// Parse `team_payoff_model` string:
 /// - `"switching_game"` → `SwitchingGame` (turn_limit = `DP_TURN_LIMIT`)
 /// - `"screened_switching_game:<trials>:<seed>:<keep_top>"` → `ScreenedSwitchingGame`
@@ -733,11 +902,13 @@ fn auto_upgrade_team_model(m : TeamPayoffModel) -> TeamPayoffModel {
 
 ///|
 /// Selection result: distribution over k-selections for both sides, plus
-/// game value and exploitability.
+/// game value, exploitability, and which solver in the fallback chain
+/// produced the strategies (`solver_path`).
 pub(all) struct SelectResult {
   format : BattleFormat
   value : Double
   exploitability : Double
+  solver_path : NashSolverPath
   team_size : Int
   opp_size : Int
   selections : Array[Array[Int]]
@@ -783,6 +954,7 @@ pub fn compute_select_with_team_model(
   input_path~ : String = "",
   child_progress_mode~ : String = "off",
   child_progress_every~ : Int = 0,
+  nash_config~ : NashSolverConfig = NashSolverConfig::default(),
 ) -> SelectResult raise NashCliError {
   if team.length() != REQUIRED_TEAM_SIZE || opponent.length() != REQUIRED_TEAM_SIZE {
     raise InvalidJson(
@@ -853,6 +1025,7 @@ pub fn compute_select_with_team_model(
   progress(PhaseStart("select-nash", 1))
   let result = build_select_result(
     format, team, opponent, matrix, retained_rows, retained_cols,
+    nash_config~,
   )
   progress(PhaseEnd("select-nash"))
   result
@@ -872,25 +1045,22 @@ fn build_select_result(
   matrix : @nash.FiniteMatrix,
   retained_rows : Array[Int]?,
   retained_cols : Array[Int]?,
+  nash_config~ : NashSolverConfig = NashSolverConfig::default(),
 ) -> SelectResult raise NashCliError {
   let k = match format {
     Single => 3
     Double => 4
   }
-  let lp = try @nash.solve_zero_sum(matrix) catch {
-    err => raise InnerError(err.to_string())
-  }
-  let (value, p, q) = match lp {
-    Optimal(value~, row_strategy~, col_strategy~) =>
-      (value, strategy_to_array(row_strategy), strategy_to_array(col_strategy))
-    Infeasible => raise InfeasibleGame
-    Unbounded => raise UnboundedGame
-  }
-  let expl = match lp {
-    Optimal(row_strategy~, col_strategy~, ..) =>
-      @nash.exploitability(matrix, row_strategy, col_strategy)
-    _ => 0.0
-  }
+  // `solve_with_fallback` raises the same `NashCliError` variants the old
+  // direct `solve_zero_sum` callsite mapped to (Infeasible / Unbounded /
+  // InnerError), plus `NashFallbackExhausted` when both iterative fallbacks
+  // also exceed `nash_config.tol`.
+  let result = solve_with_fallback(matrix, config=nash_config)
+  let value = result.value
+  let p = strategy_to_array(result.row_strategy)
+  let q = strategy_to_array(result.col_strategy)
+  let expl = result.exploitability
+  let solver_path = result.solver_path
   let all_team = combinations_with_lead(team.length(), k)
   let all_opp = combinations_with_lead(opponent.length(), k)
   let team_indices = match retained_rows {
@@ -929,6 +1099,7 @@ fn build_select_result(
     format,
     value,
     exploitability: expl,
+    solver_path,
     team_size: team.length(),
     opp_size: opponent.length(),
     selections: sel_team,
@@ -1027,6 +1198,7 @@ pub fn run_select_typed(
       )
     _ => ()
   }
+  let nash_config = parse_nash_solver_config(obj.get("nash_solver_config"))
   // For the parallel path the children re-read the same raw JSON
   // (`team_payoff_model` is the auto-upgraded form by then, so the
   // worker also runs auto_upgrade and lands on the same params).
@@ -1061,6 +1233,7 @@ pub fn run_select_typed(
       input_path~,
       child_progress_mode~,
       child_progress_every~,
+      nash_config~,
     ) catch {
     err => {
       if input_path.length() > 0 {
@@ -1085,6 +1258,7 @@ pub fn serialize_select_result(r : SelectResult) -> String {
   out = out + "\"format\":\"" + format_label(r.format) + "\""
   out = out + ",\"value\":" + r.value.to_string()
   out = out + ",\"exploitability\":" + r.exploitability.to_string()
+  out = out + ",\"nash_solver\":\"" + solver_path_string(r.solver_path) + "\""
   out = out + ",\"selections\":" + fmt_int_2d(r.selections)
   out = out + ",\"selection_names\":" + fmt_string_2d(r.selection_names)
   out = out + ",\"opp_selections\":" + fmt_int_2d(r.opp_selections)

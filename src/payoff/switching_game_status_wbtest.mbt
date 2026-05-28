@@ -36,6 +36,9 @@ fn mk_move(
     recoil_den,
     self_ko,
     recharge,
+    healing: None,
+    weather_set: None,
+    field_set: None,
   }
 }
 
@@ -468,6 +471,14 @@ fn mk_test_state(
     opp_item_consumed: Array::make(team_size, false),
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: Array::make(team_size, false),
+    opp_leech_seeded: Array::make(team_size, false),
+    my_wish_turns: no_wish_pending(team_size),
+    opp_wish_turns: no_wish_pending(team_size),
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
 }
@@ -715,6 +726,14 @@ fn mk_same_turn_state(
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
 }
@@ -1111,6 +1130,14 @@ test "attempt_turn_with_cache: forced switch after recharger faints to EOT" {
     opp_item_consumed: [false],
     my_moves_used: [],
     opp_moves_used: [],
+    weather: @model.Weather::None,
+    weather_turns_left: 0,
+    my_leech_seeded: [false, false],
+    opp_leech_seeded: [false],
+    my_wish_turns: -1,
+    opp_wish_turns: -1,
+    field: @model.Field::None,
+    field_turns_left: 0,
     turn: 0,
   }
   let outs1 = attempt_turn_with_cache(
