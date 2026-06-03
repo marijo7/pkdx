@@ -112,6 +112,10 @@ pub(all) struct SwitchingGameState {
   weather_turns_left : Int
   my_leech_seeded : Array[Bool]
   opp_leech_seeded : Array[Bool]
+  // per-slot Protean/Libero ロックタイプ。""=未発動、型名=ロック中。
+  // switch-out と mega でリセット（後段）。
+  my_protean_locked : Array[String]
+  opp_protean_locked : Array[String]
   my_wish_turns : Int
   opp_wish_turns : Int
   // Stage D (field semantics): mirror weather / weather_turns_left for terrain.
@@ -223,7 +227,6 @@ pub(all) struct SideAttempt {
   post_status : @model.StatusCondition
 } derive(Debug)
 
-
 ///|
 /// A single-turn action: use a move from the active Pokemon's moveset, or
 /// switch to another (alive, non-active) Pokemon on the same team.
@@ -326,14 +329,7 @@ pub fn new_stats_with_progress(
   if log_every <= 0 {
     return new_stats()
   }
-  {
-    hits: 0,
-    misses: 0,
-    cached_states: 0,
-    last_logged: 0,
-    log_every,
-    progress,
-  }
+  { hits: 0, misses: 0, cached_states: 0, last_logged: 0, log_every, progress }
 }
 
 ///|
@@ -365,7 +361,6 @@ fn can_mega(
     Some(_) => true
   }
 }
-
 
 ///|
 /// Is at least one Pokemon on this side still alive?
@@ -411,10 +406,10 @@ pub fn terminal_value(
 ) -> Double? {
   let my_alive = any_alive(state.my_hps)
   let opp_alive = any_alive(state.opp_hps)
-  if !(my_alive) {
+  if !my_alive {
     return Some(-1.0)
   }
-  if !(opp_alive) {
+  if !opp_alive {
     return Some(1.0)
   }
   if state.turn >= turn_limit {
@@ -438,8 +433,24 @@ pub fn terminal_value(
 /// when `is_mega` is true and the original has a `mega_form`. HP is intentionally
 /// preserved from the base Pokemon (mega does not change max or current HP).
 /// Items and move list stay untouched.
-fn effective_combatant(c : Combatant, is_mega : Bool) -> Combatant {
-  match (is_mega, c.mega_form) {
+///
+/// Precedence (適用順):
+///   1. mega form 解決 — `is_mega && mega_form` のとき type/ability/stats を override
+///   2. tera 中 (`c.tera_type != ""`) は Protean override 無効 — テラスタルが
+///      タイプを支配し、後段の Tera 処理 (engine の `tera_type` 経路) に委ねる
+///   3. Protean lock を最後に適用 — `protean_locked != "" && tera_type == ""` の
+///      とき返す Pokemon を `type1=protean_locked, type2=""` に上書きする
+///      (へんげんじざい / リベロ は使用者を変化技タイプの単タイプにする)
+///
+/// override を最後に適用することで mega 解決結果にも一律でかぶせられる。mega と
+/// Protean は同ターン両立しない (mega が Protean をリセットする) が、順序非依存に
+/// するため override を末尾に置く。
+fn effective_combatant(
+  c : Combatant,
+  is_mega : Bool,
+  protean_locked? : String = "",
+) -> Combatant {
+  let base_or_mega : Combatant = match (is_mega, c.mega_form) {
     (true, Some(m)) => {
       let base = c.pokemon
       let effective_pokemon : @model.Pokemon = {
@@ -483,6 +494,18 @@ fn effective_combatant(c : Combatant, is_mega : Bool) -> Combatant {
     }
     _ => c
   }
+  // Protean lock: tera 中は型固定なので override しない (テラスが支配)。
+  if protean_locked != "" && base_or_mega.tera_type == "" {
+    let p = base_or_mega.pokemon
+    let locked_pokemon : @model.Pokemon = {
+      ..p,
+      type1: protean_locked,
+      type2: "",
+    }
+    { ..base_or_mega, pokemon: locked_pokemon }
+  } else {
+    base_or_mega
+  }
 }
 
 ///|
@@ -524,11 +547,20 @@ fn recompute_actual_stats_for_mega(
     @model.Standard => @damage.Standard(ivs~)
   }
   let bases : FixedArray[Int] = [
-    post_mega.hp, post_mega.atk, post_mega.def_, post_mega.spa, post_mega.spd,
+    post_mega.hp,
+    post_mega.atk,
+    post_mega.def_,
+    post_mega.spa,
+    post_mega.spd,
     post_mega.spe,
   ]
   let stat_indices : FixedArray[@model.StatIndex] = [
-    HP, Atk, Def, SpA, SpD, Spe,
+    HP,
+    Atk,
+    Def,
+    SpA,
+    SpD,
+    Spe,
   ]
   let out : Array[Int] = Array::make(6, 0)
   // HP: mega は HP を変えないので、pre-mega の actual_stats[0] が与えられて
@@ -662,20 +694,26 @@ fn compute_mean_damage(
   mv : @model.Move,
   atk_rank : Int,
   def_rank : Int,
-  atk_burn~ : Bool = false,
-  atk_ranks_full~ : Array[Int]? = None,
-  def_ranks_full~ : Array[Int]? = None,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_burn? : Bool = false,
+  atk_ranks_full? : Array[Int]? = None,
+  def_ranks_full? : Array[Int]? = None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  protean_consumed? : Bool = false,
 ) -> Int {
   weighted_mean_floor(
     compute_damage_variants(
-      attacker, defender, mv, atk_rank, def_rank,
+      attacker,
+      defender,
+      mv,
+      atk_rank,
+      def_rank,
       atk_burn~,
       atk_ranks_full~,
       def_ranks_full~,
       weather~,
       field~,
+      protean_consumed~,
     ),
   )
 }
@@ -698,21 +736,20 @@ fn compute_damage_variants(
   mv : @model.Move,
   atk_rank : Int,
   def_rank : Int,
-  atk_burn~ : Bool = false,
-  allow_reflect~ : Bool = true,
-  atk_ranks_full~ : Array[Int]? = None,
-  def_ranks_full~ : Array[Int]? = None,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_burn? : Bool = false,
+  allow_reflect? : Bool = true,
+  atk_ranks_full? : Array[Int]? = None,
+  def_ranks_full? : Array[Int]? = None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  protean_consumed? : Bool = false,
 ) -> Array[@model.DamageOutcome] {
   // Status moves and zero-power moves never deal damage. Mirror the early
   // return in `mean_damage_cached` so the variants pipeline does not invent
   // a stray damage point from the engine's variant table for moves whose
   // power was clamped to 0 upstream.
   if mv.power <= 0 {
-    return [
-      { probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] },
-    ]
+    return [{ probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] }]
   }
   // 反射技 (カウンター / ミラーコート / メタルバースト / ほうふく) は通常の
   // 威力ベース計算を走らせず、相手の各候補攻撃技から「後手確率 × 命中確率 ×
@@ -724,7 +761,11 @@ fn compute_damage_variants(
     match @damage.is_reflect_move(mv.name) {
       Some(kind) =>
         return reflect_damage_outcomes(
-          kind, attacker, defender, atk_rank, def_rank,
+          kind,
+          attacker,
+          defender,
+          atk_rank,
+          def_rank,
           atk_burn~,
           atk_ranks_full~,
           def_ranks_full~,
@@ -736,18 +777,18 @@ fn compute_damage_variants(
   }
   let r = @damage.calc_damage(
     build_input_with_ranks(
-      attacker, defender, mv, atk_rank, def_rank, weather~, field~,
+      attacker,
+      defender,
+      mv,
+      atk_rank,
+      def_rank,
+      weather~,
+      field~,
+      protean_consumed~,
     ),
   )
   if r.is_immune {
-    return [
-      {
-        probability: 1.0,
-        mean_damage: 0,
-        hits_count: 0,
-        hit_steps: [],
-      },
-    ]
+    return [{ probability: 1.0, mean_damage: 0, hits_count: 0, hit_steps: [] }]
   }
   outcomes_from_calc_result(r, mv.category, atk_burn)
 }
@@ -784,10 +825,10 @@ fn reflect_damage_outcomes(
   atk_rank : Int,
   def_rank : Int,
   atk_burn~ : Bool,
-  atk_ranks_full~ : Array[Int]? = None,
-  def_ranks_full~ : Array[Int]? = None,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_ranks_full? : Array[Int]? = None,
+  def_ranks_full? : Array[Int]? = None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
 ) -> Array[@model.DamageOutcome] {
   let _ = atk_burn
   // Type immunity check: reflect move's own type vs the OPPONENT (defender,
@@ -809,9 +850,7 @@ fn reflect_damage_outcomes(
     None => false
   }
   if type_immune {
-    return [
-      { probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] },
-    ]
+    return [{ probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] }]
   }
   // Filter candidate incoming moves: category accepted, non-zero power,
   // and itself non-reflect (so a reflect-only defender produces 0).
@@ -853,7 +892,11 @@ fn reflect_damage_outcomes(
       None => atk_rank
     }
     let step1_outcomes = compute_damage_variants(
-      defender, attacker, mv_i, step1_atk_rank, step1_def_rank,
+      defender,
+      attacker,
+      mv_i,
+      step1_atk_rank,
+      step1_def_rank,
       atk_burn=false,
       allow_reflect=false,
       weather~,
@@ -872,9 +915,7 @@ fn reflect_damage_outcomes(
     candidate_count = candidate_count + 1
   }
   if candidate_count == 0 {
-    return [
-      { probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] },
-    ]
+    return [{ probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] }]
   }
   let (mult_num, mult_den) = @damage.reflect_multiplier(kind)
   let expected = accumulator *
@@ -994,7 +1035,7 @@ fn apply_damage_variants_fanout(
   // `damage_variants_cached` so that the engine's variant table is
   // memoised across recursion. Inside this helper we own the per-variant
   // state mutation and the four post-hit fanouts only.
-  let target_is_me = !(attacker_is_me)
+  let target_is_me = !attacker_is_me
   let target_slot = defender_active
   let attacker_slot = attacker_active
   let leaves : Array[(Double, SwitchingGameState)] = []
@@ -1012,20 +1053,19 @@ fn apply_damage_variants_fanout(
     } else {
       outcome.mean_damage
     }
-    let state_dmg = with_hp_damage(state, target_is_me, target_slot, outcome.mean_damage)
+    let state_dmg = with_hp_damage(
+      state,
+      target_is_me,
+      target_slot,
+      outcome.mean_damage,
+    )
     // Phase 2-E (#91): per-variant post-hit state effects so recoil /
     // self_ko / recharge / stat_effects compound on the variant-specific
     // damage rather than a single mean. State remains immutable; with_-
     // post_hit_effects produces a fresh copy with updated arrays.
     let state_v = with_post_hit_effects(
-      state_dmg,
-      attacker_is_me,
-      attacker_slot,
-      target_slot,
-      attacker_team,
-      defender_team,
-      attacker_move,
-      actual_dmg,
+      state_dmg, attacker_is_me, attacker_slot, target_slot, attacker_team, defender_team,
+      attacker_move, actual_dmg,
     )
     let sub = compose_fanouts(state_v, [
       fn(s) {
@@ -1141,6 +1181,8 @@ fn with_post_hit_effects(
   // attacker_is_me=false → my_leech_seeded)。
   let my_leech_seeded = state.my_leech_seeded.copy()
   let opp_leech_seeded = state.opp_leech_seeded.copy()
+  let my_protean_locked = state.my_protean_locked.copy()
+  let opp_protean_locked = state.opp_protean_locked.copy()
   // Stage 11 (Wish): attacker 側の wish_turns scalar を書き換える可能性があるため
   // ローカルに展開。Wish 以外の経路では unchanged のまま base state を経由して
   // 最終 state にスレッドされる。Wish の発動は attacker_is_me に応じて
@@ -1232,7 +1274,8 @@ fn with_post_hit_effects(
         state.my_megaed[defender_active]
       }
       let defender_eff = effective_combatant(
-        defender_team[defender_active], def_megaed,
+        defender_team[defender_active],
+        def_megaed,
       )
       let is_grass = defender_eff.pokemon.type1 == "くさ" ||
         defender_eff.pokemon.type2 == "くさ"
@@ -1244,10 +1287,8 @@ fn with_post_hit_effects(
           if defender_active < opp_leech_seeded.length() {
             opp_leech_seeded[defender_active] = true
           }
-        } else {
-          if defender_active < my_leech_seeded.length() {
-            my_leech_seeded[defender_active] = true
-          }
+        } else if defender_active < my_leech_seeded.length() {
+          my_leech_seeded[defender_active] = true
         }
       }
     }
@@ -1285,14 +1326,50 @@ fn with_post_hit_effects(
     // attacker_is_me=true なら my_wish_turns、false なら opp_wish_turns を
     // 書き換える。pkdx single battle は active が常に 1 つなので per-side
     // scalar で十分 (長さ 1 の per-active-slot 配列と観測上等価)。
-    Some(@model.Wish) => {
+    Some(@model.Wish) =>
       if attacker_is_me {
         my_wish_turns = 2
       } else {
         opp_wish_turns = 2
       }
-    }
     _ => ()
+  }
+  // Stage 2 (Protean / Libero): へんげんじざい / リベロ は技を撃った瞬間に
+  // 使用者をその技のタイプ 1 つに変える。記録は attacker 側 (LeechSeed が
+  // defender 側だったのと対照的) の `*_protean_locked[active]` に `mv.type_`
+  // を書き込む。発動条件:
+  //   - ability が へんげんじざい / リベロ
+  //   - tera_type == "" (テラスタル中は型固定で Protean 非発動)
+  //   - 当該 slot が未ロック ("") — once per switch-in。既にロック済みなら
+  //     何度撃っても最初のタイプのまま (再変化しない)
+  //   - カテゴリゲートなし: Status 技でも発動する
+  // ダメージ計算は本フックより前に走るため、発動技自身のダメージは pre-lock
+  // 状態で計算済み。ここで記録するロックは「次手以降」の damage / type-chart に
+  // 効く。記録値は `mv.type_` で variant 非依存なので、`apply_damage_variants-
+  // _fanout` から variant ごとに呼ばれても全 leaf が同一値に収束する。
+  //
+  // Stage 5: 発動判定は base ability ではなく **mega 後の実効特性** (`atk_eff`)
+  // を見る。base げきりゅう → mega へんげんじざい のように mega で初めて Protean
+  // を得る個体でも正しく発動を記録するため。`atk_eff` は上で grounded 判定用に
+  // `effective_combatant(_, atk_is_mega)` で解決済み (mega 解決のみ・protean
+  // override なしなので ability は base/mega いずれも正しく出る)。tera 判定も
+  // `atk_eff.tera_type` で統一する (effective_combatant は tera_type を変えない
+  // ので atk.tera_type と等価だが、実効 combatant 経由で一貫させる)。
+  let attacker_protean = if attacker_is_me {
+    my_protean_locked
+  } else {
+    opp_protean_locked
+  }
+  if attacker_active < attacker_team.length() {
+    if (
+        atk_eff.ability == "へんげんじざい" ||
+        atk_eff.ability == "リベロ"
+      ) &&
+      atk_eff.tera_type == "" &&
+      attacker_active < attacker_protean.length() &&
+      attacker_protean[attacker_active] == "" {
+      attacker_protean[attacker_active] = mv.type_
+    }
   }
   if mv.self_ko {
     attacker_hps[attacker_active] = 0
@@ -1339,13 +1416,14 @@ fn with_post_hit_effects(
     weather_turns_left: new_weather_turns,
     my_leech_seeded,
     opp_leech_seeded,
+    my_protean_locked,
+    opp_protean_locked,
     my_wish_turns,
     opp_wish_turns,
     field: new_field,
     field_turns_left: new_field_turns,
   }
 }
-
 
 ///|
 fn clamp_zero(x : Int) -> Int {
@@ -1447,4 +1525,3 @@ pub fn resolve_post_hit_effects(
     attacker_must_recharge[attacker_active] = true
   }
 }
-

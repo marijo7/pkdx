@@ -60,16 +60,16 @@ fn vp_input(
   mv : @model.Move,
   atk : @model.Pokemon,
   dfn : @model.Pokemon,
-  weather~ : @model.Weather = @model.Weather::None,
-  def_rank_up_count~ : Int = 0,
-  atk_rank_up_count~ : Int = 0,
-  atk_hp_num~ : Int = 2,
-  atk_hp_den~ : Int = 2,
-  def_item_removable~ : Bool = false,
-  def_item~ : String = "",
-  def_status_condition~ : @model.StatusCondition = @model.StatusCondition::None,
-  atk_status_condition~ : @model.StatusCondition = @model.StatusCondition::None,
-  fainted_count~ : Int = 0,
+  weather? : @model.Weather = @model.Weather::None,
+  def_rank_up_count? : Int = 0,
+  atk_rank_up_count? : Int = 0,
+  atk_hp_num? : Int = 2,
+  atk_hp_den? : Int = 2,
+  def_item_removable? : Bool = false,
+  def_item? : String = "",
+  def_status_condition? : @model.StatusCondition = @model.StatusCondition::None,
+  atk_status_condition? : @model.StatusCondition = @model.StatusCondition::None,
+  fainted_count? : Int = 0,
 ) -> @model.DamageCalcInput {
   {
     attacker: atk,
@@ -104,6 +104,7 @@ fn vp_input(
     def_item_removable,
     multi_hit_mode: @model.MultiHit::Auto,
     disguise_active: false,
+    protean_consumed: false,
     incoming: None,
   }
 }
@@ -116,9 +117,12 @@ test "weather ball: no weather keeps normal 50" {
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"))
   let (p, t) = resolve_move_type_override(mv, inp)
   @debug.debug_inspect(p, content="50")
-  @debug.debug_inspect(t, content=(
-    #|"ノーマル"
-  ))
+  @debug.debug_inspect(
+    t,
+    content=(
+      #|"ノーマル"
+    ),
+  )
 }
 
 ///|
@@ -127,9 +131,12 @@ test "weather ball: sun promotes to 100 fire" {
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Sun)
   let (p, t) = resolve_move_type_override(mv, inp)
   @debug.debug_inspect(p, content="100")
-  @debug.debug_inspect(t, content=(
-    #|"ほのお"
-  ))
+  @debug.debug_inspect(
+    t,
+    content=(
+      #|"ほのお"
+    ),
+  )
 }
 
 ///|
@@ -137,9 +144,12 @@ test "weather ball: rain promotes to 100 water" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Rain)
   let (_, t) = resolve_move_type_override(mv, inp)
-  @debug.debug_inspect(t, content=(
-    #|"みず"
-  ))
+  @debug.debug_inspect(
+    t,
+    content=(
+      #|"みず"
+    ),
+  )
 }
 
 ///|
@@ -147,9 +157,12 @@ test "weather ball: sand promotes to 100 rock" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Sand)
   let (_, t) = resolve_move_type_override(mv, inp)
-  @debug.debug_inspect(t, content=(
-    #|"いわ"
-  ))
+  @debug.debug_inspect(
+    t,
+    content=(
+      #|"いわ"
+    ),
+  )
 }
 
 ///|
@@ -157,9 +170,12 @@ test "weather ball: snow promotes to 100 ice" {
   let mv = vp_move("ウェザーボール", "ノーマル", @model.Special, 50)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Snow)
   let (_, t) = resolve_move_type_override(mv, inp)
-  @debug.debug_inspect(t, content=(
-    #|"こおり"
-  ))
+  @debug.debug_inspect(
+    t,
+    content=(
+      #|"こおり"
+    ),
+  )
 }
 
 ///|
@@ -168,9 +184,12 @@ test "move type override: unrelated move passes through" {
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), weather=Sun)
   let (p, t) = resolve_move_type_override(mv, inp)
   @debug.debug_inspect(p, content="40")
-  @debug.debug_inspect(t, content=(
-    #|"ノーマル"
-  ))
+  @debug.debug_inspect(
+    t,
+    content=(
+      #|"ノーマル"
+    ),
+  )
 }
 
 // ---- resolve_variable_power ----
@@ -178,11 +197,15 @@ test "move type override: unrelated move passes through" {
 ///|
 test "stored power: +3 opponent produces 80" {
   let mv = vp_move("つけあがる", "エスパー", @model.Special, 20)
-  let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), def_rank_up_count=3,
-  )
+  let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), def_rank_up_count=3)
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="80")
 }
@@ -192,7 +215,13 @@ test "stored power: zero boosts keeps base 20" {
   let mv = vp_move("つけあがる", "エスパー", @model.Special, 20)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"))
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="20")
 }
@@ -200,11 +229,15 @@ test "stored power: zero boosts keeps base 20" {
 ///|
 test "assist power: +6 self produces 140" {
   let mv = vp_move("アシストパワー", "エスパー", @model.Special, 20)
-  let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_rank_up_count=6,
-  )
+  let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"), atk_rank_up_count=6)
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="140")
 }
@@ -213,10 +246,19 @@ test "assist power: +6 self produces 140" {
 test "assist power: clamps at 860 for absurd boost counts" {
   let mv = vp_move("アシストパワー", "エスパー", @model.Special, 20)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_rank_up_count=100,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_rank_up_count=100,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="860")
 }
@@ -226,10 +268,20 @@ test "lash out: HP at 50% exactly doubles power" {
   // やけっぱち: self HP <= max/2 → 2x power
   let mv = vp_move("やけっぱち", "あく", @model.Physical, 75)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_hp_num=1, atk_hp_den=2,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_hp_num=1,
+    atk_hp_den=2,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="150")
 }
@@ -238,10 +290,20 @@ test "lash out: HP at 50% exactly doubles power" {
 test "lash out: HP at 51% keeps base power" {
   let mv = vp_move("やけっぱち", "あく", @model.Physical, 75)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_hp_num=51, atk_hp_den=100,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_hp_num=51,
+    atk_hp_den=100,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="75")
 }
@@ -257,7 +319,13 @@ test "knock off: removable item boosts to 97" {
     def_item_removable=true,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="97")
 }
@@ -266,10 +334,19 @@ test "knock off: removable item boosts to 97" {
 test "knock off: no item keeps base 65" {
   let mv = vp_move("はたきおとす", "あく", @model.Physical, 65)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), def_item_removable=false,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    def_item_removable=false,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="65")
 }
@@ -278,10 +355,19 @@ test "knock off: no item keeps base 65" {
 test "hex: burn defender doubles to 130" {
   let mv = vp_move("たたりめ", "ゴースト", @model.Special, 65)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), def_status_condition=Burn,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    def_status_condition=Burn,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="130")
 }
@@ -291,7 +377,13 @@ test "hex: healthy defender keeps base 65" {
   let mv = vp_move("たたりめ", "ゴースト", @model.Special, 65)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"))
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="65")
 }
@@ -301,10 +393,19 @@ test "facade: burn attacker doubles power to 140" {
   // からげんき: 攻撃側のまひ / やけど / どく / もうどく で 2x。
   let mv = vp_move("からげんき", "ノーマル", @model.Physical, 70)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_status_condition=Burn,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_status_condition=Burn,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="140")
 }
@@ -313,10 +414,19 @@ test "facade: burn attacker doubles power to 140" {
 test "facade: poison attacker doubles power" {
   let mv = vp_move("からげんき", "ノーマル", @model.Physical, 70)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_status_condition=Poison,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_status_condition=Poison,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="140")
 }
@@ -331,7 +441,13 @@ test "facade: badly poisoned attacker doubles power" {
     atk_status_condition=BadPoison(0),
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="140")
 }
@@ -340,10 +456,19 @@ test "facade: badly poisoned attacker doubles power" {
 test "facade: paralyzed attacker doubles power" {
   let mv = vp_move("からげんき", "ノーマル", @model.Physical, 70)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_status_condition=Paralyze,
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_status_condition=Paralyze,
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="140")
 }
@@ -353,10 +478,19 @@ test "facade: sleep attacker keeps base power (can't act)" {
   // ねむり中は行動不能なので発動前提を満たさず base のまま。
   let mv = vp_move("からげんき", "ノーマル", @model.Physical, 70)
   let inp = vp_input(
-    mv, vp_pokemon("a"), vp_pokemon("b"), atk_status_condition=Sleep(2),
+    mv,
+    vp_pokemon("a"),
+    vp_pokemon("b"),
+    atk_status_condition=Sleep(2),
   )
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="70")
 }
@@ -366,7 +500,13 @@ test "facade: healthy attacker keeps base power" {
   let mv = vp_move("からげんき", "ノーマル", @model.Physical, 70)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"))
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="70")
 }
@@ -377,7 +517,13 @@ test "existing weight move: body slam-like pass-through when not overridden" {
   let mv = vp_move("たいあたり", "ノーマル", @model.Physical, 40)
   let inp = vp_input(mv, vp_pokemon("a"), vp_pokemon("b"))
   let p = resolve_variable_power(
-    mv.power, mv, inp, inp.defender, inp.attacker, "", "",
+    mv.power,
+    mv,
+    inp,
+    inp.defender,
+    inp.attacker,
+    "",
+    "",
   )
   @debug.debug_inspect(p, content="40")
 }

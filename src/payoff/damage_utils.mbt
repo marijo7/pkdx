@@ -72,7 +72,8 @@ fn effective_hp(c : Combatant) -> Int {
     Some(arr) => arr[0]
     None =>
       match c.stat_system {
-        @model.Champions => @damage.calc_stat_champions(c.pokemon.hp, is_hp=true)
+        @model.Champions =>
+          @damage.calc_stat_champions(c.pokemon.hp, is_hp=true)
         @model.Standard => @damage.calc_stat(c.pokemon.hp, is_hp=true)
       }
   }
@@ -97,20 +98,8 @@ fn attack_defense_stat_indices(mv : @model.Move) -> (Int, Int) {
   let is_psyshock_family = name == "サイコショック" ||
     name == "サイコブレイク" ||
     name == "しんぴのつるぎ"
-  let atk_idx = if is_body_press {
-    2
-  } else if is_physical {
-    1
-  } else {
-    3
-  }
-  let def_idx = if is_psyshock_family {
-    2
-  } else if is_physical {
-    2
-  } else {
-    4
-  }
+  let atk_idx = if is_body_press { 2 } else if is_physical { 1 } else { 3 }
+  let def_idx = if is_psyshock_family { 2 } else if is_physical { 2 } else { 4 }
   (atk_idx, def_idx)
 }
 
@@ -135,8 +124,9 @@ fn build_input_with_ranks(
   mv : @model.Move,
   atk_rank : Int,
   def_rank : Int,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  protean_consumed? : Bool = false,
 ) -> @model.DamageCalcInput {
   let (atk_idx, def_idx) = attack_defense_stat_indices(mv)
   let atk_stat_override = match atk.actual_stats {
@@ -184,6 +174,12 @@ fn build_input_with_ranks(
     def_item_removable: false,
     multi_hit_mode: @model.MultiHit::Auto,
     disguise_active: false,
+    // Protean/Libero ロック中 (`protean_consumed=true`) は attacker の type1 が
+    // ロックタイプへ override 済み (effective_combatant)。engine の通常 STAB 経路が
+    // 「ロックタイプ一致技に STAB」「ロックタイプで被弾」を担うため、engine 側の
+    // Protean gate (二重 push) は止める。未ロック (false) なら発動技に engine が
+    // STAB を push する (出てきて最初の攻撃挙動 = CLI 既定と一致)。
+    protean_consumed,
     incoming: None,
   }
 }

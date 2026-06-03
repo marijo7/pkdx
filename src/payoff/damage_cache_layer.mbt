@@ -41,6 +41,14 @@ pub(all) struct DamageKey {
   // every post-terrain-change lookup for the rest of the run, silently
   // suppressing the field bonus / debuff.
   field : @model.Field
+  // Stage 6 (protean-libero plan): the type the attacker / defender is locked
+  // into by へんげんじざい / リベロ ("" = not locked). `effective_combatant`
+  // overrides type1/type2 from this value, so the same slot index produces
+  // different damage for "not locked" vs "ほのおロック" vs "みずロック". Without
+  // these in the key, a matchup cached before the lock would shadow every
+  // post-lock lookup (and distinct locked types would alias each other).
+  atk_protean_locked : String
+  def_protean_locked : String
 } derive(Eq, Hash)
 
 ///|
@@ -80,7 +88,7 @@ pub(all) struct DamageCache {
 /// graph`) should; tests and short-lived paths leave it defaulted to
 /// `None` and the disk is never touched.
 pub fn new_damage_cache(
-  disk~ : @damage_cache.DamageDiskCache? = None,
+  disk? : @damage_cache.DamageDiskCache? = None,
 ) -> DamageCache {
   {
     data: @hashmap.HashMap([]),
@@ -142,11 +150,19 @@ fn combatant_to_cache_key_input(
   mv : @model.Move,
   atk_rank : Int,
   def_rank : Int,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> @damage_cache.CacheKeyInput {
   let input = build_input_with_ranks(
-    atk, dfn, mv, atk_rank, def_rank, weather~, field~,
+    atk,
+    dfn,
+    mv,
+    atk_rank,
+    def_rank,
+    weather~,
+    field~,
   )
   let version_str = match atk.stat_system {
     @model.Champions => "champions"
@@ -214,6 +230,9 @@ fn combatant_to_cache_key_input(
     def_item_removable: false,
     multi_hit_mode: "",
     disguise_active: false,
+    // Protean/Libero ロック中は attacker の type1 が override 済みなので engine の
+    // 二重 STAB push を止める (build_input_with_ranks の protean_consumed と同配線)。
+    protean_consumed: atk_protean_locked != "",
     incoming_attacker: "",
     incoming_move: "",
     incoming_atk_ability: "",
@@ -227,6 +246,8 @@ fn combatant_to_cache_key_input(
     incoming_atk_hp_den: 0,
     incoming_tera_type: "",
     incoming_critical: false,
+    atk_protean_locked,
+    def_protean_locked,
   }
 }
 
@@ -256,11 +277,14 @@ fn mean_damage_via_disk(
   mv : @model.Move,
   atk_rank : Int,
   def_rank : Int,
-  atk_burn~ : Bool = false,
-  atk_ranks_full~ : Array[Int]? = None,
-  def_ranks_full~ : Array[Int]? = None,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_burn? : Bool = false,
+  atk_ranks_full? : Array[Int]? = None,
+  def_ranks_full? : Array[Int]? = None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  protean_consumed? : Bool = false,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> Int {
   // 反射技は L2 disk を経由しない。@damage.calc_damage に incoming=None で
   // 渡すと反射 fallback が走り 0 ダメージの JSON が書き込まれてしまうため、
@@ -269,33 +293,58 @@ fn mean_damage_via_disk(
   // outcomes に到達し、フル rank 配列を使って Step1 を正しく評価する。
   if @damage.is_reflect_move(mv.name) is Some(_) {
     return compute_mean_damage(
-      attacker, defender, mv, atk_rank, def_rank,
-      atk_burn=atk_burn,
+      attacker,
+      defender,
+      mv,
+      atk_rank,
+      def_rank,
+      atk_burn~,
       atk_ranks_full~,
       def_ranks_full~,
       weather~,
       field~,
+      protean_consumed~,
     )
   }
   let disk = match cache.disk {
     Some(d) => d
     None =>
       return compute_mean_damage(
-        attacker, defender, mv, atk_rank, def_rank, atk_burn=atk_burn,
+        attacker,
+        defender,
+        mv,
+        atk_rank,
+        def_rank,
+        atk_burn~,
         weather~,
         field~,
+        protean_consumed~,
       )
   }
   let key_input = combatant_to_cache_key_input(
-    attacker, defender, mv, atk_rank, def_rank, weather~, field~,
+    attacker,
+    defender,
+    mv,
+    atk_rank,
+    def_rank,
+    weather~,
+    field~,
+    atk_protean_locked~,
+    def_protean_locked~,
   )
   let key = match @damage_cache.build_cache_key(key_input) {
     Ok(k) => k
     Err(_) =>
       return compute_mean_damage(
-        attacker, defender, mv, atk_rank, def_rank, atk_burn=atk_burn,
+        attacker,
+        defender,
+        mv,
+        atk_rank,
+        def_rank,
+        atk_burn~,
         weather~,
         field~,
+        protean_consumed~,
       )
   }
   match @damage_cache.get(disk, key) {
@@ -312,20 +361,34 @@ fn mean_damage_via_disk(
           // or malformed JSON) → recompute and overwrite with v3 payload.
           cache.disk_misses = cache.disk_misses + 1
           compute_and_populate_disk(
-            disk, key, attacker, defender, mv, atk_rank, def_rank,
-            atk_burn=atk_burn,
+            disk,
+            key,
+            attacker,
+            defender,
+            mv,
+            atk_rank,
+            def_rank,
+            atk_burn~,
             weather~,
             field~,
+            protean_consumed~,
           )
         }
       }
     None => {
       cache.disk_misses = cache.disk_misses + 1
       compute_and_populate_disk(
-        disk, key, attacker, defender, mv, atk_rank, def_rank,
-        atk_burn=atk_burn,
+        disk,
+        key,
+        attacker,
+        defender,
+        mv,
+        atk_rank,
+        def_rank,
+        atk_burn~,
         weather~,
         field~,
+        protean_consumed~,
       )
     }
   }
@@ -349,12 +412,20 @@ fn compute_and_populate_disk(
   mv : @model.Move,
   atk_rank : Int,
   def_rank : Int,
-  atk_burn~ : Bool = false,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_burn? : Bool = false,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  protean_consumed? : Bool = false,
 ) -> Int {
   let input = build_input_with_ranks(
-    attacker, defender, mv, atk_rank, def_rank, weather~, field~,
+    attacker,
+    defender,
+    mv,
+    atk_rank,
+    def_rank,
+    weather~,
+    field~,
+    protean_consumed~,
   )
   let r = @damage.calc_damage(input)
   let json_format = @cli.parse_output_format("json")
@@ -395,6 +466,8 @@ fn prepare_damage_lookup(
   def_item_consumed : Bool,
   weather : @model.Weather,
   field : @model.Field,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> (Bool, DamageKey, Combatant, Combatant, @model.Move) {
   let raw_attacker_full = if my_attacker {
     my_team[atk_idx]
@@ -438,6 +511,8 @@ fn prepare_damage_lookup(
       def_item_consumed,
       weather,
       field,
+      atk_protean_locked,
+      def_protean_locked,
     }
     return (true, dummy_key, raw_attacker, raw_defender, mv)
   }
@@ -465,6 +540,8 @@ fn prepare_damage_lookup(
     def_item_consumed,
     weather,
     field,
+    atk_protean_locked,
+    def_protean_locked,
   }
   (false, key, raw_attacker, raw_defender, mv)
 }
@@ -484,13 +561,15 @@ pub fn mean_damage_cached(
   mv_idx : Int,
   my_team : Array[Combatant],
   opp_team : Array[Combatant],
-  atk_mega~ : Bool = false,
-  def_mega~ : Bool = false,
-  atk_burn~ : Bool = false,
-  atk_item_consumed~ : Bool = false,
-  def_item_consumed~ : Bool = false,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_mega? : Bool = false,
+  def_mega? : Bool = false,
+  atk_burn? : Bool = false,
+  atk_item_consumed? : Bool = false,
+  def_item_consumed? : Bool = false,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> Int {
   let (early, key, raw_attacker, raw_defender, mv) = prepare_damage_lookup(
     my_attacker,
@@ -508,6 +587,8 @@ pub fn mean_damage_cached(
     def_item_consumed,
     weather,
     field,
+    atk_protean_locked~,
+    def_protean_locked~,
   )
   if early {
     return 0
@@ -519,8 +600,19 @@ pub fn mean_damage_cached(
     }
     None => {
       cache.misses = cache.misses + 1
-      let attacker = effective_combatant(raw_attacker, atk_mega)
-      let defender = effective_combatant(raw_defender, def_mega)
+      let attacker = effective_combatant(
+        raw_attacker,
+        atk_mega,
+        protean_locked=atk_protean_locked,
+      )
+      let defender = effective_combatant(
+        raw_defender,
+        def_mega,
+        protean_locked=def_protean_locked,
+      )
+      // Protean ロック中は attacker の type1 が override 済みなので engine の
+      // 二重 STAB push を止める (build_input_with_ranks の protean_consumed)。
+      let protean_consumed = atk_protean_locked != ""
       // Both branches reduce through `apply_burn_to_mean`, so the L2-backed
       // path is guaranteed bit-identical to the L1-only path for the same
       // matchup — the disk still stores only pre-burn 16-roll tables.
@@ -533,11 +625,14 @@ pub fn mean_damage_cached(
             mv,
             key.atk_rank,
             key.def_rank,
-            atk_burn=atk_burn,
+            atk_burn~,
             atk_ranks_full=Some(atk_ranks),
             def_ranks_full=Some(def_ranks),
             weather~,
             field~,
+            protean_consumed~,
+            atk_protean_locked~,
+            def_protean_locked~,
           )
         None =>
           compute_mean_damage(
@@ -546,11 +641,12 @@ pub fn mean_damage_cached(
             mv,
             key.atk_rank,
             key.def_rank,
-            atk_burn=atk_burn,
+            atk_burn~,
             atk_ranks_full=Some(atk_ranks),
             def_ranks_full=Some(def_ranks),
             weather~,
             field~,
+            protean_consumed~,
           )
       }
       cache.data[key] = v
@@ -583,13 +679,15 @@ fn damage_variants_cached(
   mv_idx : Int,
   my_team : Array[Combatant],
   opp_team : Array[Combatant],
-  atk_mega~ : Bool = false,
-  def_mega~ : Bool = false,
-  atk_burn~ : Bool = false,
-  atk_item_consumed~ : Bool = false,
-  def_item_consumed~ : Bool = false,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_mega? : Bool = false,
+  def_mega? : Bool = false,
+  atk_burn? : Bool = false,
+  atk_item_consumed? : Bool = false,
+  def_item_consumed? : Bool = false,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> Array[@model.DamageOutcome] {
   let (early, key, raw_attacker, raw_defender, mv) = prepare_damage_lookup(
     my_attacker,
@@ -607,6 +705,8 @@ fn damage_variants_cached(
     def_item_consumed,
     weather,
     field,
+    atk_protean_locked~,
+    def_protean_locked~,
   )
   if early {
     return [{ probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] }]
@@ -618,19 +718,31 @@ fn damage_variants_cached(
     }
     None => {
       cache.misses = cache.misses + 1
-      let attacker = effective_combatant(raw_attacker, atk_mega)
-      let defender = effective_combatant(raw_defender, def_mega)
+      let attacker = effective_combatant(
+        raw_attacker,
+        atk_mega,
+        protean_locked=atk_protean_locked,
+      )
+      let defender = effective_combatant(
+        raw_defender,
+        def_mega,
+        protean_locked=def_protean_locked,
+      )
+      // Protean ロック中は attacker の type1 が override 済みなので engine の
+      // 二重 STAB push を止める (build_input_with_ranks の protean_consumed)。
+      let protean_consumed = atk_protean_locked != ""
       let v = compute_damage_variants(
         attacker,
         defender,
         mv,
         key.atk_rank,
         key.def_rank,
-        atk_burn=atk_burn,
+        atk_burn~,
         atk_ranks_full=Some(atk_ranks),
         def_ranks_full=Some(def_ranks),
         weather~,
         field~,
+        protean_consumed~,
       )
       cache.variants_data[key] = v
       // Touch the L2 disk cache so cross-session damage entries stay
@@ -649,11 +761,14 @@ fn damage_variants_cached(
             mv,
             key.atk_rank,
             key.def_rank,
-            atk_burn=atk_burn,
+            atk_burn~,
             atk_ranks_full=Some(atk_ranks),
             def_ranks_full=Some(def_ranks),
             weather~,
             field~,
+            protean_consumed~,
+            atk_protean_locked~,
+            def_protean_locked~,
           )
         }
         None => ()

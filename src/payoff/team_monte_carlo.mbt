@@ -26,9 +26,30 @@ fn best_expected_damage(
   dfn : Combatant,
   atk_ranks : Array[Int],
   def_ranks : Array[Int],
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> Double {
+  // Stage 7 (Protean / Libero MC parity): override attacker / defender combatant
+  // 経由で Protean ロックを適用する。MC は mega を未モデルなので is_mega=false
+  // 固定で DP 側 `effective_combatant` を再利用する (SSoT 共有)。`protean_locked`
+  // が "" のときは override 無し (= 元 combatant そのまま、bit-exact)。
+  // `protean_consumed = (locked != "")` を build_input_with_ranks に渡し、ロック中は
+  // engine の Protean STAB gate を止める (override 済み type1 で通常 STAB 経路を
+  // 通す)。team_perform_attack と同一の override をここでも掛けることで greedy
+  // 選択と実ダメージの乖離を防ぐ。
+  let atk_eff = effective_combatant(
+    atk,
+    false,
+    protean_locked=atk_protean_locked,
+  )
+  let dfn_eff = effective_combatant(
+    dfn,
+    false,
+    protean_locked=def_protean_locked,
+  )
+  let atk_consumed = atk_protean_locked != ""
   let mut best = 0.0
   for i in 0..<atk.moves.length() {
     let mv = atk.moves[i]
@@ -53,7 +74,16 @@ fn best_expected_damage(
       @model.Status => 0
     }
     let r = @damage.calc_damage(
-      build_input_with_ranks(atk, dfn, mv, ar, dr, weather~, field~),
+      build_input_with_ranks(
+        atk_eff,
+        dfn_eff,
+        mv,
+        ar,
+        dr,
+        weather~,
+        field~,
+        protean_consumed=atk_consumed,
+      ),
     )
     let avg = avg_damage(r)
     if avg > best {
@@ -97,10 +127,22 @@ fn greedy_team_action(
   opp_ranks : Array[Int],
   rng : @random.Rand,
   epsilon : Double,
-  must_recharge~ : Bool = false,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  must_recharge? : Bool = false,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  my_protean_locked? : Array[String] = [],
+  opp_protean_locked? : Array[String] = [],
 ) -> TeamAction? {
+  // Stage 7 (Protean / Libero MC parity): per-slot ロックを greedy 評価に
+  // 渡すための helper。slot が範囲外 / 配列未指定 (テスト用 default [] ) のとき
+  // "" を返す (= override 無し)。
+  fn locked_of(arr : Array[String], slot : Int) -> String {
+    if slot >= 0 && slot < arr.length() {
+      arr[slot]
+    } else {
+      ""
+    }
+  }
   if must_recharge && my_hps[active] > 0 {
     return Some(TmUseMove(0))
   }
@@ -118,10 +160,17 @@ fn greedy_team_action(
     let mut best = alive_slots[0]
     let mut best_score = -1.0
     let zero_ranks = [0, 0, 0, 0, 0]
+    let opp_locked = locked_of(opp_protean_locked, opp_active)
     for s in alive_slots {
       let score = best_expected_damage(
-        my_team[s], opp_team[opp_active], zero_ranks, opp_ranks,
-        weather~, field~,
+        my_team[s],
+        opp_team[opp_active],
+        zero_ranks,
+        opp_ranks,
+        weather~,
+        field~,
+        atk_protean_locked=locked_of(my_protean_locked, s),
+        def_protean_locked=opp_locked,
       )
       if score > best_score {
         best_score = score
@@ -174,9 +223,17 @@ fn greedy_team_action(
       1.0
     }
   }
+  let opp_locked = locked_of(opp_protean_locked, opp_active)
+  let active_locked = locked_of(my_protean_locked, active)
   let stay_value = best_expected_damage(
-      my_team[active], opp_team[opp_active], my_ranks, opp_ranks,
-      weather~, field~,
+      my_team[active],
+      opp_team[opp_active],
+      my_ranks,
+      opp_ranks,
+      weather~,
+      field~,
+      atk_protean_locked=active_locked,
+      def_protean_locked=opp_locked,
     ) /
     opp_hp_denom
   let mut best_switch = -1
@@ -187,8 +244,14 @@ fn greedy_team_action(
       continue
     }
     let v = best_expected_damage(
-        my_team[s], opp_team[opp_active], zero_ranks, opp_ranks,
-        weather~, field~,
+        my_team[s],
+        opp_team[opp_active],
+        zero_ranks,
+        opp_ranks,
+        weather~,
+        field~,
+        atk_protean_locked=locked_of(my_protean_locked, s),
+        def_protean_locked=opp_locked,
       ) /
       opp_hp_denom
     if v > best_switch_value {
@@ -200,11 +263,19 @@ fn greedy_team_action(
     return Some(TmSwitch(best_switch))
   }
   // UseMove: greedy max-damage move. Fall back to move 0 if no damaging move.
-  match pick_best_move(
-    my_team[active], opp_team[opp_active],
-    atk_ranks=my_ranks, def_ranks=opp_ranks,
-    weather~, field~,
-  ) {
+  // Stage 7: ロック中の Protean 個体は active_locked / opp_locked を渡して
+  // 実ダメージ (`team_perform_attack`) と同じ override で move を選ぶ。
+  match
+    pick_best_move(
+      my_team[active],
+      opp_team[opp_active],
+      atk_ranks=my_ranks,
+      def_ranks=opp_ranks,
+      weather~,
+      field~,
+      atk_protean_locked=active_locked,
+      def_protean_locked=opp_locked,
+    ) {
     Some(i) => Some(TmUseMove(i))
     None => Some(TmUseMove(0))
   }
@@ -323,7 +394,8 @@ fn team_apply_post_hit(
         false
       }
       let defender_eff = effective_combatant(
-        defender_team[defender_active], def_megaed,
+        defender_team[defender_active],
+        def_megaed,
       )
       let is_grass = defender_eff.pokemon.type1 == "くさ" ||
         defender_eff.pokemon.type2 == "くさ"
@@ -428,9 +500,11 @@ fn team_perform_attack(
   rng : @random.Rand,
   atk_ranks : Array[Int],
   def_ranks : Array[Int],
-  atk_burn~ : Bool = false,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  atk_burn? : Bool = false,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
+  atk_protean_locked? : String = "",
+  def_protean_locked? : String = "",
 ) -> Int {
   if mv.power <= 0 {
     // Status moves: no damage and no in-place stat mutation. The caller
@@ -448,9 +522,32 @@ fn team_perform_attack(
     @model.Special => def_ranks[3]
     @model.Status => 0
   }
+  // Stage 7 (Protean / Libero MC parity): 実ダメージ解決も greedy 選択
+  // (`best_expected_damage` / `pick_best_move`) と **同一の** Protean override を
+  // 適用する。片側だけ override すると greedy と実ダメージが乖離して DP / MC
+  // parity が崩れる (過去類似バグ)。MC は mega 未モデルなので is_mega=false 固定で
+  // `effective_combatant` を再利用 (SSoT)。"" のときは override 無しで bit-exact。
+  let attacker_eff = effective_combatant(
+    attacker,
+    false,
+    protean_locked=atk_protean_locked,
+  )
+  let defender_eff = effective_combatant(
+    defender,
+    false,
+    protean_locked=def_protean_locked,
+  )
+  let atk_consumed = atk_protean_locked != ""
   let r = @damage.calc_damage(
     build_input_with_ranks(
-      attacker, defender, mv, atk_rank, def_rank, weather~, field~,
+      attacker_eff,
+      defender_eff,
+      mv,
+      atk_rank,
+      def_rank,
+      weather~,
+      field~,
+      protean_consumed=atk_consumed,
     ),
   )
   if r.is_immune {
@@ -545,7 +642,7 @@ fn mc_try_apply_status(
   defender_hps : Array[Int],
   defender_status_arr : Array[@model.StatusCondition],
   defender_slot : Int,
-  field~ : @model.Field = @model.Field::None,
+  field? : @model.Field = @model.Field::None,
 ) -> Unit {
   let eff = match mv.status_effect {
     None => return
@@ -579,7 +676,7 @@ fn mc_try_apply_status(
       return
     }
   }
-  if !(rand_bool(rng, chance.to_double() / 100.0)) {
+  if !rand_bool(rng, chance.to_double() / 100.0) {
     return
   }
   defender_status_arr[defender_slot] = @model.inflict_status(kind)
@@ -619,6 +716,35 @@ fn mc_psychic_priority_blocked(
 // pre-Stage-13 と完全一致 (関数本体が同じ).
 
 ///|
+/// Stage 7 (Protean / Libero MC parity): 攻撃が解決した直後に attacker スロットへ
+/// Protean ロックを記録する。DP 側 `with_post_hit_effects` の記録条件と semantics
+/// 一致:
+///   - 実効特性が へんげんじざい / リベロ (MC は mega 未モデルなので raw ability)
+///   - tera_type == "" (テラス中は型固定で Protean 非発動)
+///   - 当該 slot が未ロック ("") — once per switch-in
+/// 記録値は `mv.type_`。status 技でもカテゴリゲートなしで発動する。
+fn record_protean_lock(
+  locked : Array[String],
+  active : Int,
+  attacker : Combatant,
+  mv : @model.Move,
+) -> Unit {
+  if active < 0 || active >= locked.length() {
+    return
+  }
+  if locked[active] != "" {
+    return
+  }
+  if attacker.tera_type != "" {
+    return
+  }
+  if attacker.ability == "へんげんじざい" ||
+    attacker.ability == "リベロ" {
+    locked[active] = mv.type_
+  }
+}
+
+///|
 /// Run a single team rollout trial. Returns own-side value in `[-1, +1]`:
 ///
 /// - `+1.0` when all opponents are KO'd
@@ -631,10 +757,10 @@ pub fn team_rollout(
   own : Array[Combatant],
   opp : Array[Combatant],
   rng : @random.Rand,
-  turn_limit~ : Int = MC_TURN_LIMIT,
-  epsilon~ : Double = default_rollout_epsilon,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  turn_limit? : Int = MC_TURN_LIMIT,
+  epsilon? : Double = default_rollout_epsilon,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
 ) -> Double {
   let own_hps = Array::make(own.length(), 0)
   let opp_hps = Array::make(opp.length(), 0)
@@ -647,10 +773,12 @@ pub fn team_rollout(
   let own_ranks = [0, 0, 0, 0, 0]
   let opp_ranks = [0, 0, 0, 0, 0]
   let own_status : Array[@model.StatusCondition] = Array::make(
-    own.length(), @model.None,
+    own.length(),
+    @model.None,
   )
   let opp_status : Array[@model.StatusCondition] = Array::make(
-    opp.length(), @model.None,
+    opp.length(),
+    @model.None,
   )
   // Per-slot recharge flag. Set by a recharge move (Hyper Beam etc.) landing;
   // consumed next turn by forcing a skipped UseMove. Switching is blocked
@@ -689,6 +817,13 @@ pub fn team_rollout(
   let opp_wish_turns : Array[Int] = [-1]
   let own_megaed : Array[Bool] = Array::make(own.length(), false)
   let opp_megaed : Array[Bool] = Array::make(opp.length(), false)
+  // Stage 7 (Protean / Libero MC parity): per-slot ロックタイプ。へんげんじざい /
+  // リベロ 使用者が初手で撃った技のタイプを記録し、以降の攻撃 STAB / 被弾相性に
+  // override で効かせる (DP 側 `SwitchingGameState.{my,opp}_protean_locked` と同じ
+  // slot-bound semantics)。"" = 未ロック。switch-out で "" に戻る (once per
+  // switch-in)。MC は mega 未モデルなので mega リセットは無い。
+  let own_protean_locked : Array[String] = Array::make(own.length(), "")
+  let opp_protean_locked : Array[String] = Array::make(opp.length(), "")
   let mut own_active = 0
   let mut opp_active = 0
   for _ in 0..<turn_limit {
@@ -705,6 +840,8 @@ pub fn team_rollout(
       must_recharge=own_must_recharge[own_active],
       weather=weather_state[0],
       field=field_state[0],
+      my_protean_locked=own_protean_locked,
+      opp_protean_locked~,
     )
     let a_opp = greedy_team_action(
       opp_active,
@@ -719,6 +856,8 @@ pub fn team_rollout(
       must_recharge=opp_must_recharge[opp_active],
       weather=weather_state[0],
       field=field_state[0],
+      my_protean_locked=opp_protean_locked,
+      opp_protean_locked=own_protean_locked,
     )
     match (a_own, a_opp) {
       (None, _) => return -1.0
@@ -747,31 +886,33 @@ pub fn team_rollout(
         let mut own_attempt_acts = true
         let mut opp_attempt_acts = true
         match ao {
-          TmUseMove(mi) => {
+          TmUseMove(mi) =>
             if own_start_recharging {
               own_attempt_acts = false
             } else {
               let (st, acts) = mc_resolve_attempt(
-                own_status[own_active], own[own_active].moves[mi].accuracy, rng,
+                own_status[own_active],
+                own[own_active].moves[mi].accuracy,
+                rng,
               )
               own_status[own_active] = st
               own_attempt_acts = acts
             }
-          }
           _ => ()
         }
         match ap {
-          TmUseMove(mi) => {
+          TmUseMove(mi) =>
             if opp_start_recharging {
               opp_attempt_acts = false
             } else {
               let (st, acts) = mc_resolve_attempt(
-                opp_status[opp_active], opp[opp_active].moves[mi].accuracy, rng,
+                opp_status[opp_active],
+                opp[opp_active].moves[mi].accuracy,
+                rng,
               )
               opp_status[opp_active] = st
               opp_attempt_acts = acts
             }
-          }
           _ => ()
         }
         // Step 2: apply switches. Reset toxic counter on the switched-out
@@ -788,6 +929,12 @@ pub fn team_rollout(
             if own_active < own_leech_seeded.length() {
               own_leech_seeded[own_active] = false
             }
+            // Stage 7: switch-out で出ていくスロットの Protean ロックを解除
+            // (DP 側 transition_with_cache / partial_act_outcomes の Switch arm と
+            // 同 semantics)。leech_seeded と同じ index・同じタイミング。
+            if own_active < own_protean_locked.length() {
+              own_protean_locked[own_active] = ""
+            }
             own_active = i
             reset_ranks(own_ranks)
           }
@@ -801,13 +948,16 @@ pub fn team_rollout(
             if opp_active < opp_leech_seeded.length() {
               opp_leech_seeded[opp_active] = false
             }
+            if opp_active < opp_protean_locked.length() {
+              opp_protean_locked[opp_active] = ""
+            }
             opp_active = i
             reset_ranks(opp_ranks)
           }
           _ => ()
         }
         // Step 3: resolve moves honouring paralysis speed halving and skips.
-        if !(own_switches) && !(opp_switches) {
+        if !own_switches && !opp_switches {
           let mi_own = match ao {
             TmUseMove(i) => i
             _ => -1
@@ -837,8 +987,12 @@ pub fn team_rollout(
             base_spe_opp
           }
           let s = turn_order_sign(
-            own[own_active], mv_own.priority, eff_spe_own, opp[opp_active],
-            mv_opp.priority, eff_spe_opp,
+            own[own_active],
+            mv_own.priority,
+            eff_spe_own,
+            opp[opp_active],
+            mv_opp.priority,
+            eff_spe_opp,
           )
           let own_first = if s > 0 {
             true
@@ -857,24 +1011,60 @@ pub fn team_rollout(
             // Stage H: Psychic Terrain priority block — own の priority>0 技は
             // grounded な opp に対し無効化 (DP resolve 側 Stage G-3 と一致)。
             if own_attempt_acts &&
-              !mc_psychic_priority_blocked(mv_own, field_state[0], opp[opp_active]) {
+              !mc_psychic_priority_blocked(
+                mv_own,
+                field_state[0],
+                opp[opp_active],
+              ) {
               let before = opp_hps[opp_active]
               opp_hps[opp_active] = team_perform_attack(
-                own[own_active], opp[opp_active], before, mv_own,
-                rng, own_ranks, opp_ranks, atk_burn=is_burned(own_pre_status),
-                weather=weather_state[0], field=field_state[0],
+                own[own_active],
+                opp[opp_active],
+                before,
+                mv_own,
+                rng,
+                own_ranks,
+                opp_ranks,
+                atk_burn=is_burned(own_pre_status),
+                weather=weather_state[0],
+                field=field_state[0],
+                atk_protean_locked=own_protean_locked[own_active],
+                def_protean_locked=opp_protean_locked[opp_active],
               )
               team_apply_post_hit(
-                own_hps, own_active, own_ranks, own_must_recharge,
-                own_status, own_wish_turns, own,
-                opp_hps, opp_active, opp_ranks,
-                opp_leech_seeded, opp, opp_megaed,
-                weather_state, weather_turns_state,
-                field_state, field_turns_state,
-                mv_own, before - opp_hps[opp_active],
+                own_hps,
+                own_active,
+                own_ranks,
+                own_must_recharge,
+                own_status,
+                own_wish_turns,
+                own,
+                opp_hps,
+                opp_active,
+                opp_ranks,
+                opp_leech_seeded,
+                opp,
+                opp_megaed,
+                weather_state,
+                weather_turns_state,
+                field_state,
+                field_turns_state,
+                mv_own,
+                before - opp_hps[opp_active],
+              )
+              record_protean_lock(
+                own_protean_locked,
+                own_active,
+                own[own_active],
+                mv_own,
               )
               mc_try_apply_status(
-                rng, mv_own, opp, opp_hps, opp_status, opp_active,
+                rng,
+                mv_own,
+                opp,
+                opp_hps,
+                opp_status,
+                opp_active,
                 field=field_state[0],
               )
               if all_ko(own_hps) {
@@ -884,37 +1074,73 @@ pub fn team_rollout(
                 return 1.0
               }
               if action_blocked_by_fresh_status(
-                opp_pre_status,
-                opp_status[opp_active],
-              ) {
+                  opp_pre_status,
+                  opp_status[opp_active],
+                ) {
                 opp_blocked_mid_turn = true
               }
             }
             if opp_hps[opp_active] > 0 &&
               own_hps[own_active] > 0 &&
               opp_attempt_acts &&
-              !(opp_blocked_mid_turn) &&
-              !mc_psychic_priority_blocked(mv_opp, field_state[0], own[own_active]) {
+              !opp_blocked_mid_turn &&
+              !mc_psychic_priority_blocked(
+                mv_opp,
+                field_state[0],
+                own[own_active],
+              ) {
               // Read burn *after* first leg's status fan-out so a fresh burn
               // from own's move halves opp's physical damage this turn.
               let opp_burn_now = is_burned(opp_status[opp_active])
               let before = own_hps[own_active]
               own_hps[own_active] = team_perform_attack(
-                opp[opp_active], own[own_active], before, mv_opp,
-                rng, opp_ranks, own_ranks, atk_burn=opp_burn_now,
-                weather=weather_state[0], field=field_state[0],
+                opp[opp_active],
+                own[own_active],
+                before,
+                mv_opp,
+                rng,
+                opp_ranks,
+                own_ranks,
+                atk_burn=opp_burn_now,
+                weather=weather_state[0],
+                field=field_state[0],
+                atk_protean_locked=opp_protean_locked[opp_active],
+                def_protean_locked=own_protean_locked[own_active],
               )
               team_apply_post_hit(
-                opp_hps, opp_active, opp_ranks, opp_must_recharge,
-                opp_status, opp_wish_turns, opp,
-                own_hps, own_active, own_ranks,
-                own_leech_seeded, own, own_megaed,
-                weather_state, weather_turns_state,
-                field_state, field_turns_state,
-                mv_opp, before - own_hps[own_active],
+                opp_hps,
+                opp_active,
+                opp_ranks,
+                opp_must_recharge,
+                opp_status,
+                opp_wish_turns,
+                opp,
+                own_hps,
+                own_active,
+                own_ranks,
+                own_leech_seeded,
+                own,
+                own_megaed,
+                weather_state,
+                weather_turns_state,
+                field_state,
+                field_turns_state,
+                mv_opp,
+                before - own_hps[own_active],
+              )
+              record_protean_lock(
+                opp_protean_locked,
+                opp_active,
+                opp[opp_active],
+                mv_opp,
               )
               mc_try_apply_status(
-                rng, mv_opp, own, own_hps, own_status, own_active,
+                rng,
+                mv_opp,
+                own,
+                own_hps,
+                own_status,
+                own_active,
                 field=field_state[0],
               )
               if all_ko(own_hps) {
@@ -929,24 +1155,60 @@ pub fn team_rollout(
             // Stage H: Psychic Terrain priority block — opp の priority>0 技は
             // grounded な own に対し無効化 (DP resolve 側 Stage G-3 と一致)。
             if opp_attempt_acts &&
-              !mc_psychic_priority_blocked(mv_opp, field_state[0], own[own_active]) {
+              !mc_psychic_priority_blocked(
+                mv_opp,
+                field_state[0],
+                own[own_active],
+              ) {
               let before = own_hps[own_active]
               own_hps[own_active] = team_perform_attack(
-                opp[opp_active], own[own_active], before, mv_opp,
-                rng, opp_ranks, own_ranks, atk_burn=is_burned(opp_pre_status),
-                weather=weather_state[0], field=field_state[0],
+                opp[opp_active],
+                own[own_active],
+                before,
+                mv_opp,
+                rng,
+                opp_ranks,
+                own_ranks,
+                atk_burn=is_burned(opp_pre_status),
+                weather=weather_state[0],
+                field=field_state[0],
+                atk_protean_locked=opp_protean_locked[opp_active],
+                def_protean_locked=own_protean_locked[own_active],
               )
               team_apply_post_hit(
-                opp_hps, opp_active, opp_ranks, opp_must_recharge,
-                opp_status, opp_wish_turns, opp,
-                own_hps, own_active, own_ranks,
-                own_leech_seeded, own, own_megaed,
-                weather_state, weather_turns_state,
-                field_state, field_turns_state,
-                mv_opp, before - own_hps[own_active],
+                opp_hps,
+                opp_active,
+                opp_ranks,
+                opp_must_recharge,
+                opp_status,
+                opp_wish_turns,
+                opp,
+                own_hps,
+                own_active,
+                own_ranks,
+                own_leech_seeded,
+                own,
+                own_megaed,
+                weather_state,
+                weather_turns_state,
+                field_state,
+                field_turns_state,
+                mv_opp,
+                before - own_hps[own_active],
+              )
+              record_protean_lock(
+                opp_protean_locked,
+                opp_active,
+                opp[opp_active],
+                mv_opp,
               )
               mc_try_apply_status(
-                rng, mv_opp, own, own_hps, own_status, own_active,
+                rng,
+                mv_opp,
+                own,
+                own_hps,
+                own_status,
+                own_active,
                 field=field_state[0],
               )
               if all_ko(own_hps) {
@@ -956,35 +1218,71 @@ pub fn team_rollout(
                 return 1.0
               }
               if action_blocked_by_fresh_status(
-                own_pre_status,
-                own_status[own_active],
-              ) {
+                  own_pre_status,
+                  own_status[own_active],
+                ) {
                 own_blocked_mid_turn = true
               }
             }
             if own_hps[own_active] > 0 &&
               opp_hps[opp_active] > 0 &&
               own_attempt_acts &&
-              !(own_blocked_mid_turn) &&
-              !mc_psychic_priority_blocked(mv_own, field_state[0], opp[opp_active]) {
+              !own_blocked_mid_turn &&
+              !mc_psychic_priority_blocked(
+                mv_own,
+                field_state[0],
+                opp[opp_active],
+              ) {
               let own_burn_now = is_burned(own_status[own_active])
               let before = opp_hps[opp_active]
               opp_hps[opp_active] = team_perform_attack(
-                own[own_active], opp[opp_active], before, mv_own,
-                rng, own_ranks, opp_ranks, atk_burn=own_burn_now,
-                weather=weather_state[0], field=field_state[0],
+                own[own_active],
+                opp[opp_active],
+                before,
+                mv_own,
+                rng,
+                own_ranks,
+                opp_ranks,
+                atk_burn=own_burn_now,
+                weather=weather_state[0],
+                field=field_state[0],
+                atk_protean_locked=own_protean_locked[own_active],
+                def_protean_locked=opp_protean_locked[opp_active],
               )
               team_apply_post_hit(
-                own_hps, own_active, own_ranks, own_must_recharge,
-                own_status, own_wish_turns, own,
-                opp_hps, opp_active, opp_ranks,
-                opp_leech_seeded, opp, opp_megaed,
-                weather_state, weather_turns_state,
-                field_state, field_turns_state,
-                mv_own, before - opp_hps[opp_active],
+                own_hps,
+                own_active,
+                own_ranks,
+                own_must_recharge,
+                own_status,
+                own_wish_turns,
+                own,
+                opp_hps,
+                opp_active,
+                opp_ranks,
+                opp_leech_seeded,
+                opp,
+                opp_megaed,
+                weather_state,
+                weather_turns_state,
+                field_state,
+                field_turns_state,
+                mv_own,
+                before - opp_hps[opp_active],
+              )
+              record_protean_lock(
+                own_protean_locked,
+                own_active,
+                own[own_active],
+                mv_own,
               )
               mc_try_apply_status(
-                rng, mv_own, opp, opp_hps, opp_status, opp_active,
+                rng,
+                mv_own,
+                opp,
+                opp_hps,
+                opp_status,
+                opp_active,
                 field=field_state[0],
               )
               if all_ko(own_hps) {
@@ -995,7 +1293,7 @@ pub fn team_rollout(
               }
             }
           }
-        } else if !(own_switches) {
+        } else if !own_switches {
           let mi_own = match ao {
             TmUseMove(i) => i
             _ => -1
@@ -1004,24 +1302,60 @@ pub fn team_rollout(
           let own_burn = is_burned(own_status[own_active])
           // Stage H: Psychic Terrain priority block (DP resolve Stage G-3 と一致)。
           if own_attempt_acts &&
-            !mc_psychic_priority_blocked(mv_own, field_state[0], opp[opp_active]) {
+            !mc_psychic_priority_blocked(
+              mv_own,
+              field_state[0],
+              opp[opp_active],
+            ) {
             let before = opp_hps[opp_active]
             opp_hps[opp_active] = team_perform_attack(
-              own[own_active], opp[opp_active], before, mv_own,
-              rng, own_ranks, opp_ranks, atk_burn=own_burn,
-              weather=weather_state[0], field=field_state[0],
+              own[own_active],
+              opp[opp_active],
+              before,
+              mv_own,
+              rng,
+              own_ranks,
+              opp_ranks,
+              atk_burn=own_burn,
+              weather=weather_state[0],
+              field=field_state[0],
+              atk_protean_locked=own_protean_locked[own_active],
+              def_protean_locked=opp_protean_locked[opp_active],
             )
             team_apply_post_hit(
-              own_hps, own_active, own_ranks, own_must_recharge,
-              own_status, own_wish_turns, own,
-              opp_hps, opp_active, opp_ranks,
-              opp_leech_seeded, opp, opp_megaed,
-              weather_state, weather_turns_state,
-              field_state, field_turns_state,
-              mv_own, before - opp_hps[opp_active],
+              own_hps,
+              own_active,
+              own_ranks,
+              own_must_recharge,
+              own_status,
+              own_wish_turns,
+              own,
+              opp_hps,
+              opp_active,
+              opp_ranks,
+              opp_leech_seeded,
+              opp,
+              opp_megaed,
+              weather_state,
+              weather_turns_state,
+              field_state,
+              field_turns_state,
+              mv_own,
+              before - opp_hps[opp_active],
+            )
+            record_protean_lock(
+              own_protean_locked,
+              own_active,
+              own[own_active],
+              mv_own,
             )
             mc_try_apply_status(
-              rng, mv_own, opp, opp_hps, opp_status, opp_active,
+              rng,
+              mv_own,
+              opp,
+              opp_hps,
+              opp_status,
+              opp_active,
               field=field_state[0],
             )
             if all_ko(own_hps) {
@@ -1031,7 +1365,7 @@ pub fn team_rollout(
               return 1.0
             }
           }
-        } else if !(opp_switches) {
+        } else if !opp_switches {
           let mi_opp = match ap {
             TmUseMove(i) => i
             _ => -1
@@ -1040,24 +1374,60 @@ pub fn team_rollout(
           let opp_burn = is_burned(opp_status[opp_active])
           // Stage H: Psychic Terrain priority block (DP resolve Stage G-3 と一致)。
           if opp_attempt_acts &&
-            !mc_psychic_priority_blocked(mv_opp, field_state[0], own[own_active]) {
+            !mc_psychic_priority_blocked(
+              mv_opp,
+              field_state[0],
+              own[own_active],
+            ) {
             let before = own_hps[own_active]
             own_hps[own_active] = team_perform_attack(
-              opp[opp_active], own[own_active], before, mv_opp,
-              rng, opp_ranks, own_ranks, atk_burn=opp_burn,
-              weather=weather_state[0], field=field_state[0],
+              opp[opp_active],
+              own[own_active],
+              before,
+              mv_opp,
+              rng,
+              opp_ranks,
+              own_ranks,
+              atk_burn=opp_burn,
+              weather=weather_state[0],
+              field=field_state[0],
+              atk_protean_locked=opp_protean_locked[opp_active],
+              def_protean_locked=own_protean_locked[own_active],
             )
             team_apply_post_hit(
-              opp_hps, opp_active, opp_ranks, opp_must_recharge,
-              opp_status, opp_wish_turns, opp,
-              own_hps, own_active, own_ranks,
-              own_leech_seeded, own, own_megaed,
-              weather_state, weather_turns_state,
-              field_state, field_turns_state,
-              mv_opp, before - own_hps[own_active],
+              opp_hps,
+              opp_active,
+              opp_ranks,
+              opp_must_recharge,
+              opp_status,
+              opp_wish_turns,
+              opp,
+              own_hps,
+              own_active,
+              own_ranks,
+              own_leech_seeded,
+              own,
+              own_megaed,
+              weather_state,
+              weather_turns_state,
+              field_state,
+              field_turns_state,
+              mv_opp,
+              before - own_hps[own_active],
+            )
+            record_protean_lock(
+              opp_protean_locked,
+              opp_active,
+              opp[opp_active],
+              mv_opp,
             )
             mc_try_apply_status(
-              rng, mv_opp, own, own_hps, own_status, own_active,
+              rng,
+              mv_opp,
+              own,
+              own_hps,
+              own_status,
+              own_active,
               field=field_state[0],
             )
             if all_ko(own_hps) {
@@ -1101,20 +1471,34 @@ pub fn team_rollout(
 
         // === Step 4.1: 天候ダメ (Sand chip) ===
         apply_sand_damage_active(
-          own_active, own_hps, own, own_megaed, own_max, weather_state[0],
+          own_active,
+          own_hps,
+          own,
+          own_megaed,
+          own_max,
+          weather_state[0],
         )
         apply_sand_damage_active(
-          opp_active, opp_hps, opp, opp_megaed, opp_max, weather_state[0],
+          opp_active,
+          opp_hps,
+          opp,
+          opp_megaed,
+          opp_max,
+          weather_state[0],
         )
 
         // === Step 4.2: アイテム回復 (たべのこし) ===
         // eot_leftovers_heal は HP<=0 で early return するので、Sand チップで
         // KO されたあとは heal が発火しない (DP 側と整合)。
         own_hps[own_active] = eot_leftovers_heal(
-          own_hps[own_active], own_max, own[own_active].item,
+          own_hps[own_active],
+          own_max,
+          own[own_active].item,
         )
         opp_hps[opp_active] = eot_leftovers_heal(
-          opp_hps[opp_active], opp_max, opp[opp_active].item,
+          opp_hps[opp_active],
+          opp_max,
+          opp[opp_active].item,
         )
 
         // === Step 4.2-bis: グラスフィールド回復 (Stage H parity) ===
@@ -1125,10 +1509,20 @@ pub fn team_rollout(
         // ScreenedSwitchingGame の MC screening phase が Grassy 回復を無視し、
         // DP refine phase と payoff が割れる。
         apply_grassy_heal_active(
-          own_active, own_hps, own, own_megaed, own_max, field_state[0],
+          own_active,
+          own_hps,
+          own,
+          own_megaed,
+          own_max,
+          field_state[0],
         )
         apply_grassy_heal_active(
-          opp_active, opp_hps, opp, opp_megaed, opp_max, field_state[0],
+          opp_active,
+          opp_hps,
+          opp,
+          opp_megaed,
+          opp_max,
+          field_state[0],
         )
 
         // === Step 4.3: やどりぎのタネ tick ===
@@ -1183,12 +1577,16 @@ pub fn team_rollout(
         // semantics 完全一致だが、SSoT 化のため DP 側を共有)。Stage 12 で確立
         // した eot_slip_active を MC でも reuse することで両者の乖離を防ぐ。
         let (new_own_hp, new_own_st) = eot_slip_active(
-          own_hps[own_active], own_max, own_status[own_active],
+          own_hps[own_active],
+          own_max,
+          own_status[own_active],
         )
         own_hps[own_active] = new_own_hp
         own_status[own_active] = new_own_st
         let (new_opp_hp, new_opp_st) = eot_slip_active(
-          opp_hps[opp_active], opp_max, opp_status[opp_active],
+          opp_hps[opp_active],
+          opp_max,
+          opp_status[opp_active],
         )
         opp_hps[opp_active] = new_opp_hp
         opp_status[opp_active] = new_opp_st
@@ -1262,9 +1660,9 @@ pub fn team_monte_carlo_value(
   opp : Array[Combatant],
   trials : Int,
   seed : UInt64,
-  turn_limit~ : Int = MC_TURN_LIMIT,
-  weather~ : @model.Weather = @model.Weather::None,
-  field~ : @model.Field = @model.Field::None,
+  turn_limit? : Int = MC_TURN_LIMIT,
+  weather? : @model.Weather = @model.Weather::None,
+  field? : @model.Field = @model.Field::None,
 ) -> Double {
   if trials <= 0 {
     return 0.0

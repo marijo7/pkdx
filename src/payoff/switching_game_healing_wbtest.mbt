@@ -21,16 +21,16 @@ fn mk_heal_move(
   type_ : String,
   category : @model.MoveCategory,
   power : Int,
-  healing~ : @model.HealingEffect? = None,
-  weather_set~ : @model.Weather? = None,
-  priority~ : Int = 0,
-  stat_effects~ : Array[@model.StatEffect] = [],
-  status_effect~ : (@model.StatusKind, Int)? = None,
-  accuracy~ : Int = 100,
-  recoil_num~ : Int = 0,
-  recoil_den~ : Int = 1,
-  self_ko~ : Bool = false,
-  recharge~ : Bool = false,
+  healing? : @model.HealingEffect? = None,
+  weather_set? : @model.Weather? = None,
+  priority? : Int = 0,
+  stat_effects? : Array[@model.StatEffect] = [],
+  status_effect? : (@model.StatusKind, Int)? = None,
+  accuracy? : Int = 100,
+  recoil_num? : Int = 0,
+  recoil_den? : Int = 1,
+  self_ko? : Bool = false,
+  recharge? : Bool = false,
 ) -> @model.Move {
   {
     name,
@@ -67,7 +67,15 @@ test "apply_healing: FixedFraction(1/2) restores max/2 — HP=1 → 51" {
     healing=Some(@model.FixedFraction(1, 2)),
   )
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None, @model.None], "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None, @model.None],
+    "",
+    0,
+    "",
   )
   @debug.assert_eq(hps[0], 51)
   // 非 active slot は触られない。
@@ -88,7 +96,15 @@ test "apply_healing: FixedFraction(1/2) no-op when already full — HP=max → m
     healing=Some(@model.FixedFraction(1, 2)),
   )
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None, @model.None], "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None, @model.None],
+    "",
+    0,
+    "",
   )
   @debug.assert_eq(hps[0], 100)
   @debug.assert_eq(hps[1], 100)
@@ -184,7 +200,9 @@ test "with_post_hit_effects: FixedFraction heals attacker active slot" {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -286,7 +304,9 @@ fn mk_weather_state() -> SwitchingGameState {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -399,7 +419,9 @@ test "apply_eot: weather counter decrement by 1 (5 → 4, Sun keeps)" {
     0,
     weather_set=Some(@model.Weather::Sun),
   )
-  let state_after_set = with_post_hit_effects(state0, true, 0, 0, team, team, mv, 0)
+  let state_after_set = with_post_hit_effects(
+    state0, true, 0, 0, team, team, mv, 0,
+  )
   @debug.assert_eq(state_after_set.weather_turns_left, 5)
   let state_after_eot = apply_eot(state_after_set, team, team)
   @debug.assert_eq(state_after_eot.weather, @model.Weather::Sun)
@@ -505,7 +527,15 @@ test "apply_healing: WeatherDependent None → default 1/2 (HP=10 → 60)" {
   let hps = [10, 100]
   let mv = mk_moonlight_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None, @model.None], "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None, @model.None],
+    "",
+    0,
+    "",
   )
   @debug.assert_eq(hps[0], 60)
   // 非 active slot は触られない。
@@ -607,8 +637,28 @@ test "apply_healing: WeatherDependent no-op when HP=max regardless of weather" {
   let hps_sun = [100]
   let hps_rain = [100]
   let mv = mk_moonlight_move()
-  apply_healing(mv, 0, hps_sun, 100, @model.Weather::Sun, [@model.None], "", 0, "")
-  apply_healing(mv, 0, hps_rain, 100, @model.Weather::Rain, [@model.None], "", 0, "")
+  apply_healing(
+    mv,
+    0,
+    hps_sun,
+    100,
+    @model.Weather::Sun,
+    [@model.None],
+    "",
+    0,
+    "",
+  )
+  apply_healing(
+    mv,
+    0,
+    hps_rain,
+    100,
+    @model.Weather::Rain,
+    [@model.None],
+    "",
+    0,
+    "",
+  )
   @debug.assert_eq(hps_sun[0], 100)
   @debug.assert_eq(hps_rain[0], 100)
 }
@@ -717,7 +767,17 @@ test "apply_healing: Rest fails under Insomnia (ふみん) — no HP / status ch
   let hps = [1, 100]
   let status : Array[@model.StatusCondition] = [@model.Burn, @model.None]
   let mv = mk_rest_move()
-  apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "ふみん", 0, "")
+  apply_healing(
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "ふみん",
+    0,
+    "",
+  )
   @debug.assert_eq(hps[0], 1)
   @debug.assert_eq(status[0], @model.Burn)
 }
@@ -728,7 +788,17 @@ test "apply_healing: Rest fails under Vital Spirit (やるき)" {
   let hps = [1]
   let status : Array[@model.StatusCondition] = [@model.Burn]
   let mv = mk_rest_move()
-  apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "やるき", 0, "")
+  apply_healing(
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "やるき",
+    0,
+    "",
+  )
   @debug.assert_eq(hps[0], 1)
   @debug.assert_eq(status[0], @model.Burn)
 }
@@ -739,7 +809,17 @@ test "apply_healing: Rest fails under Sweet Veil (スイートベール)" {
   let hps = [1]
   let status : Array[@model.StatusCondition] = [@model.Burn]
   let mv = mk_rest_move()
-  apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "スイートベール", 0, "")
+  apply_healing(
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "スイートベール",
+    0,
+    "",
+  )
   @debug.assert_eq(hps[0], 1)
   @debug.assert_eq(status[0], @model.Burn)
 }
@@ -752,7 +832,17 @@ test "apply_healing: Magic Guard does NOT block Rest (Sleep is inflicted)" {
   let hps = [1]
   let status : Array[@model.StatusCondition] = [@model.Burn]
   let mv = mk_rest_move()
-  apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "マジックガード", 0, "")
+  apply_healing(
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "マジックガード",
+    0,
+    "",
+  )
   @debug.assert_eq(hps[0], 100)
   @debug.assert_eq(status[0], @model.Sleep(2))
 }
@@ -772,7 +862,15 @@ test "apply_healing: Rest fails on grounded user under Electric Terrain" {
   let status : Array[@model.StatusCondition] = [@model.Burn, @model.None]
   let mv = mk_rest_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, status, "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "",
+    0,
+    "",
     field=@model.Field::Electric,
     attacker_grounded=true,
   )
@@ -788,7 +886,15 @@ test "apply_healing: Rest fails on grounded user under Misty Terrain" {
   let status : Array[@model.StatusCondition] = [@model.Burn, @model.None]
   let mv = mk_rest_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, status, "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "",
+    0,
+    "",
     field=@model.Field::Misty,
     attacker_grounded=true,
   )
@@ -805,7 +911,15 @@ test "apply_healing: Rest succeeds on airborne user under Electric Terrain" {
   let status : Array[@model.StatusCondition] = [@model.Burn, @model.None]
   let mv = mk_rest_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, status, "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "",
+    0,
+    "",
     field=@model.Field::Electric,
     attacker_grounded=false,
   )
@@ -822,7 +936,15 @@ test "apply_healing: Rest succeeds on grounded user under Grassy Terrain" {
   let status : Array[@model.StatusCondition] = [@model.Burn, @model.None]
   let mv = mk_rest_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, status, "", 0, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    status,
+    "",
+    0,
+    "",
     field=@model.Field::Grassy,
     attacker_grounded=true,
   )
@@ -862,11 +984,11 @@ test "apply_healing: Rest succeeds on grounded user under Grassy Terrain" {
 /// Stage 8 用の Drain Move ヘルパー。デフォルトは ギガドレイン相当 (1/2)。
 /// ドレインキッス (3/4) はパラメタで差し替える。
 fn mk_drain_move(
-  name~ : String = "ギガドレイン",
-  type_~ : String = "くさ",
-  power~ : Int = 75,
-  num~ : Int = 1,
-  den~ : Int = 2,
+  name? : String = "ギガドレイン",
+  type_? : String = "くさ",
+  power? : Int = 75,
+  num? : Int = 1,
+  den? : Int = 2,
 ) -> @model.Move {
   mk_heal_move(
     name,
@@ -884,9 +1006,7 @@ test "apply_healing: Drain(1/2) dmg=40 normal defender → +20" {
   let hps = [1, 100]
   let status : Array[@model.StatusCondition] = [@model.None, @model.None]
   let mv = mk_drain_move()
-  apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, status, "", 40, "",
-  )
+  apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "", 40, "")
   @debug.assert_eq(hps[0], 21)
   @debug.assert_eq(hps[1], 100)
 }
@@ -898,7 +1018,15 @@ test "apply_healing: Drain dmg=0 → no-op (no healing, no Liquid Ooze trigger)"
   let hps = [50]
   let mv = mk_drain_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 0, "ヘドロえき",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    0,
+    "ヘドロえき",
   )
   @debug.assert_eq(hps[0], 50)
 }
@@ -909,9 +1037,7 @@ test "apply_healing: Drain dmg=0 → no-op (no healing, no Liquid Ooze trigger)"
 test "apply_healing: Drain dmg=1 → +1 (max(1, _) floor)" {
   let hps = [10]
   let mv = mk_drain_move()
-  apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 1, "",
-  )
+  apply_healing(mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 1, "")
   @debug.assert_eq(hps[0], 11)
 }
 
@@ -924,7 +1050,15 @@ test "apply_healing: Drain dealt-based (dmg=50 dealt) → +25" {
   let hps = [40]
   let mv = mk_drain_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 50, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    50,
+    "",
   )
   // 40 + 50/2 = 40 + 25 = 65
   @debug.assert_eq(hps[0], 65)
@@ -937,7 +1071,15 @@ test "apply_healing: Drain reversed by ヘドロえき (dmg=40, HP=10) → HP=0 
   let hps = [10]
   let mv = mk_drain_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 40, "ヘドロえき",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    40,
+    "ヘドロえき",
   )
   // 10 - max(1, 40/2) = 10 - 20 = -10 → floor0 → 0
   @debug.assert_eq(hps[0], 0)
@@ -951,7 +1093,15 @@ test "apply_healing: Drain reversed by ヘドロえき at full HP → HP=80" {
   let hps = [100]
   let mv = mk_drain_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 40, "ヘドロえき",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    40,
+    "ヘドロえき",
   )
   @debug.assert_eq(hps[0], 80)
 }
@@ -964,7 +1114,15 @@ test "apply_healing: Drain ヘドロえき with dmg=0 → no-op" {
   let hps = [50]
   let mv = mk_drain_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 0, "ヘドロえき",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    0,
+    "ヘドロえき",
   )
   @debug.assert_eq(hps[0], 50)
 }
@@ -982,7 +1140,15 @@ test "apply_healing: Drain(3/4) ドレインキッス dmg=40 → +30" {
     den=4,
   )
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 40, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    40,
+    "",
   )
   // 10 + 40 * 3 / 4 = 10 + 30 = 40
   @debug.assert_eq(hps[0], 40)
@@ -1008,7 +1174,15 @@ test "apply_healing: Drain uses caller-supplied dealt dmg (Issue #2 contract)" {
   let mv = mk_drain_move()
   // dealt=20 (caller側でクランプ済み) を渡す。+10 を期待。
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 20, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    20,
+    "",
   )
   @debug.assert_eq(hps[0], 60)
 }
@@ -1021,7 +1195,15 @@ test "apply_healing: Drain at full HP normal defender → no-op" {
   let hps = [100]
   let mv = mk_drain_move()
   apply_healing(
-    mv, 0, hps, 100, @model.Weather::None, [@model.None], "", 40, "",
+    mv,
+    0,
+    hps,
+    100,
+    @model.Weather::None,
+    [@model.None],
+    "",
+    40,
+    "",
   )
   @debug.assert_eq(hps[0], 100)
 }
@@ -1086,7 +1268,9 @@ test "with_post_hit_effects: Drain heals attacker by dealt/2" {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -1165,7 +1349,9 @@ test "with_post_hit_effects: Drain reversed by defender's ヘドロえき" {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -1230,9 +1416,9 @@ fn mk_leech_seed_move() -> @model.Move {
 /// Stage 9 用の最小 Combatant ヘルパー。type1 / ability をパラメタ化して
 /// くさタイプ免疫 / Magic Guard の各境界に使う。
 fn mk_seed_combatant(
-  type1~ : String = "ノーマル",
-  type2~ : String = "",
-  ability~ : String = "",
+  type1? : String = "ノーマル",
+  type2? : String = "",
+  ability? : String = "",
 ) -> Combatant {
   let p : @model.Pokemon = {
     global_no: "0001",
@@ -1294,7 +1480,9 @@ fn mk_seed_state() -> SwitchingGameState {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -1330,9 +1518,7 @@ test "with_post_hit_effects: LeechSeed by opp plants on my side" {
   let state = mk_seed_state()
   let team = [mk_seed_combatant(), mk_seed_combatant()]
   let mv = mk_leech_seed_move()
-  let new_state = with_post_hit_effects(
-    state, false, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, false, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.my_leech_seeded[0], true)
   @debug.assert_eq(new_state.my_leech_seeded[1], false)
   @debug.assert_eq(new_state.opp_leech_seeded[0], false)
@@ -1347,9 +1533,7 @@ test "with_post_hit_effects: LeechSeed re-plant on seeded target is no-op" {
   state = { ..state, opp_leech_seeded: [true, false] }
   let team = [mk_seed_combatant(), mk_seed_combatant()]
   let mv = mk_leech_seed_move()
-  let new_state = with_post_hit_effects(
-    state, true, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, true, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.opp_leech_seeded[0], true)
   @debug.assert_eq(new_state.opp_leech_seeded[1], false)
 }
@@ -1474,7 +1658,9 @@ test "apply_eot: LeechSeed tick — both sides seeded simultaneously" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [true, false],
+    opp_protean_locked: ["", ""],
   }
   let team = [mk_seed_combatant(), mk_seed_combatant()]
   let new_state = apply_eot(state, team, team)
@@ -1502,10 +1688,14 @@ test "apply_eot: LeechSeed Magic Guard — seeded loses 0 HP, opp gains 0" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     opp_hps: [50, 100],
   }
   // my[0] を マジックガード 持ちに。
-  let my_team = [mk_seed_combatant(ability="マジックガード"), mk_seed_combatant()]
+  let my_team = [
+    mk_seed_combatant(ability="マジックガード"),
+    mk_seed_combatant(),
+  ]
   let opp_team = [mk_seed_combatant(), mk_seed_combatant()]
   let new_state = apply_eot(state, my_team, opp_team)
   // my[0] HP は不変 (Magic Guard で tick damage 無効)。
@@ -1528,6 +1718,7 @@ test "apply_eot: LeechSeed faint-from-tick — opp gains only actual drained" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     my_hps: [10, 100],
     opp_hps: [50, 100],
   }
@@ -1579,13 +1770,16 @@ test "apply_eot: LeechSeed extreme overkill — opp gains exactly drained amount
     mega_form: None,
     nature: None,
     stat_points: None,
-    // max_hp=160 → max/8=20
-    actual_stats: Some([160, 100, 100, 100, 100, 100]),
+    actual_stats: Some(
+      // max_hp=160 → max/8=20
+      [160, 100, 100, 100, 100, 100],
+    ),
     ivs: None,
   }
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     my_hps: [1, 100],
     opp_hps: [50, 100],
   }
@@ -1607,6 +1801,7 @@ test "apply_eot: LeechSeed HP=0 slot skips tick" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     my_hps: [0, 100],
     opp_hps: [50, 100],
   }
@@ -1629,9 +1824,13 @@ test "apply_eot: LeechSeed Liquid Ooze (seeded side) damages opp instead of heal
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     opp_hps: [50, 100],
   }
-  let my_team = [mk_seed_combatant(ability="ヘドロえき"), mk_seed_combatant()]
+  let my_team = [
+    mk_seed_combatant(ability="ヘドロえき"),
+    mk_seed_combatant(),
+  ]
   let opp_team = [mk_seed_combatant(), mk_seed_combatant()]
   let new_state = apply_eot(state, my_team, opp_team)
   // my[0]: 100 - 12 = 88 (seed tick は通常通り)
@@ -1649,9 +1848,13 @@ test "apply_eot: LeechSeed Liquid Ooze reversal floors opp HP at 0" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     opp_hps: [5, 100],
   }
-  let my_team = [mk_seed_combatant(ability="ヘドロえき"), mk_seed_combatant()]
+  let my_team = [
+    mk_seed_combatant(ability="ヘドロえき"),
+    mk_seed_combatant(),
+  ]
   let opp_team = [mk_seed_combatant(), mk_seed_combatant()]
   let new_state = apply_eot(state, my_team, opp_team)
   @debug.assert_eq(new_state.my_hps[0], 88)
@@ -1667,10 +1870,14 @@ test "apply_eot: LeechSeed Liquid Ooze (opp side seeded) damages my instead of h
   state = {
     ..state,
     opp_leech_seeded: [true, false],
+    opp_protean_locked: ["", ""],
     my_hps: [50, 100],
   }
   let my_team = [mk_seed_combatant(), mk_seed_combatant()]
-  let opp_team = [mk_seed_combatant(ability="ヘドロえき"), mk_seed_combatant()]
+  let opp_team = [
+    mk_seed_combatant(ability="ヘドロえき"),
+    mk_seed_combatant(),
+  ]
   let new_state = apply_eot(state, my_team, opp_team)
   @debug.assert_eq(new_state.opp_hps[0], 88)
   @debug.assert_eq(new_state.my_hps[0], 38)
@@ -1685,7 +1892,12 @@ test "transition_with_cache: Switch clears my seeded slot" {
   let team = [mk_seed_combatant(), mk_seed_combatant()]
   let cache = new_damage_cache()
   let outs = transition_with_cache(
-    state, ActionKind::Switch(1), ActionKind::Switch(0), team, team, cache,
+    state,
+    ActionKind::Switch(1),
+    ActionKind::Switch(0),
+    team,
+    team,
+    cache,
   )
   // 単一決定的遷移を仮定 (Switch+Switch は確率 1.0)。
   @debug.assert_eq(outs.length(), 1)
@@ -1702,12 +1914,19 @@ test "transition_with_cache: simultaneous Switch clears both seeded slots" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [true, false],
+    opp_protean_locked: ["", ""],
   }
   let team = [mk_seed_combatant(), mk_seed_combatant()]
   let cache = new_damage_cache()
   let outs = transition_with_cache(
-    state, ActionKind::Switch(1), ActionKind::Switch(1), team, team, cache,
+    state,
+    ActionKind::Switch(1),
+    ActionKind::Switch(1),
+    team,
+    team,
+    cache,
   )
   @debug.assert_eq(outs.length(), 1)
   let (_, new_state) = outs[0]
@@ -1730,7 +1949,12 @@ test "transition_with_cache: switch-out then switch-back keeps seeded=false" {
   let cache = new_damage_cache()
   // 1) my[0]→my[1] へ switch out。opp 側も Switch (テスト都合)。
   let outs1 = transition_with_cache(
-    state, ActionKind::Switch(1), ActionKind::Switch(0), team, team, cache,
+    state,
+    ActionKind::Switch(1),
+    ActionKind::Switch(0),
+    team,
+    team,
+    cache,
   )
   @debug.assert_eq(outs1.length(), 1)
   let (_, state_after_out) = outs1[0]
@@ -1793,7 +2017,7 @@ fn mk_painsplit_move() -> @model.Move {
 ///|
 /// Stage 10 用の Combatant ヘルパー。max_hp を actual_stats[0] で指定できる
 /// ようにする。pokemon の hp はダミー (effective_hp は actual_stats を優先)。
-fn mk_painsplit_combatant(max_hp~ : Int = 100) -> Combatant {
+fn mk_painsplit_combatant(max_hp? : Int = 100) -> Combatant {
   let p : @model.Pokemon = {
     global_no: "0001",
     name_ja: "テスト",
@@ -1854,7 +2078,9 @@ fn mk_painsplit_state() -> SwitchingGameState {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -1964,9 +2190,7 @@ test "with_post_hit_effects: PainSplit floor division on odd sum (10+91 → 50/5
   state = { ..state, my_hps: [10, 100], opp_hps: [91, 100] }
   let team = [mk_painsplit_combatant(), mk_painsplit_combatant()]
   let mv = mk_painsplit_move()
-  let new_state = with_post_hit_effects(
-    state, true, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, true, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.my_hps[0], 50)
   @debug.assert_eq(new_state.opp_hps[0], 50)
 }
@@ -1986,9 +2210,7 @@ test "with_post_hit_effects: PainSplit on fainted defender — current behavior 
   state = { ..state, my_hps: [80, 100], opp_hps: [0, 100] }
   let team = [mk_painsplit_combatant(), mk_painsplit_combatant()]
   let mv = mk_painsplit_move()
-  let new_state = with_post_hit_effects(
-    state, true, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, true, 0, 0, team, team, mv, 0)
   // avg=(80+0)/2=40。alive_actions ガードに依存し、ここでは平均化される。
   @debug.assert_eq(new_state.my_hps[0], 40)
   @debug.assert_eq(new_state.opp_hps[0], 40)
@@ -2001,9 +2223,7 @@ test "with_post_hit_effects: PainSplit at full HP both sides — no observable c
   let state = mk_painsplit_state()
   let team = [mk_painsplit_combatant(), mk_painsplit_combatant()]
   let mv = mk_painsplit_move()
-  let new_state = with_post_hit_effects(
-    state, true, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, true, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.my_hps[0], 100)
   @debug.assert_eq(new_state.opp_hps[0], 100)
 }
@@ -2018,9 +2238,7 @@ test "with_post_hit_effects: PainSplit by opp side — symmetric behavior" {
   let team = [mk_painsplit_combatant(), mk_painsplit_combatant()]
   let mv = mk_painsplit_move()
   // attacker_is_me=false: opp が攻撃側、my が defender。
-  let new_state = with_post_hit_effects(
-    state, false, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, false, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.my_hps[0], 50)
   @debug.assert_eq(new_state.opp_hps[0], 50)
 }
@@ -2075,7 +2293,7 @@ fn mk_wish_move() -> @model.Move {
 ///|
 /// Stage 11 用の Combatant ヘルパー。max_hp を actual_stats[0] で指定できる
 /// ようにする。pokemon の hp はダミー (effective_hp は actual_stats を優先)。
-fn mk_wish_combatant(max_hp~ : Int = 100) -> Combatant {
+fn mk_wish_combatant(max_hp? : Int = 100) -> Combatant {
   let p : @model.Pokemon = {
     global_no: "0001",
     name_ja: "テスト",
@@ -2136,7 +2354,9 @@ fn mk_wish_state() -> SwitchingGameState {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false, false],
+    opp_protean_locked: ["", ""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -2152,9 +2372,7 @@ test "with_post_hit_effects: Wish sets attacker side's wish_turns to 2" {
   let state = mk_wish_state()
   let team = [mk_wish_combatant(), mk_wish_combatant()]
   let mv = mk_wish_move()
-  let new_state = with_post_hit_effects(
-    state, true, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, true, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.my_wish_turns, 2)
   // opp 側は完全に不変。
   @debug.assert_eq(new_state.opp_wish_turns, -1)
@@ -2225,16 +2443,8 @@ test "apply_eot: Wish heals current active's max_hp / 2" {
   let mut state = mk_wish_state()
   // active を slot 1 にして wish 発動 (turns=0) を観測する。
   // slot 1 の max_hp は 200 (異なる Pokemon)、HP は 10 から +100 で 110 へ。
-  state = {
-    ..state,
-    my_active: 1,
-    my_hps: [100, 10],
-    my_wish_turns: 0,
-  }
-  let my_team = [
-    mk_wish_combatant(max_hp=100),
-    mk_wish_combatant(max_hp=200),
-  ]
+  state = { ..state, my_active: 1, my_hps: [100, 10], my_wish_turns: 0 }
+  let my_team = [mk_wish_combatant(max_hp=100), mk_wish_combatant(max_hp=200)]
   let opp_team = [mk_wish_combatant(), mk_wish_combatant()]
   let new_state = apply_eot(state, my_team, opp_team)
   // active=1 の HP: 10 + 200/2 = 110、wish_turns は -1 に idle。
@@ -2250,11 +2460,7 @@ test "apply_eot: Wish heals current active's max_hp / 2" {
 /// まま不変 (蘇生しない、Wish も消費される、本家挙動)。
 test "apply_eot: Wish on HP=0 active — Wish consumed, HP stays 0" {
   let mut state = mk_wish_state()
-  state = {
-    ..state,
-    my_hps: [0, 100],
-    my_wish_turns: 0,
-  }
+  state = { ..state, my_hps: [0, 100], my_wish_turns: 0 }
   let team = [mk_wish_combatant(), mk_wish_combatant()]
   let new_state = apply_eot(state, team, team)
   // HP=0 のまま (蘇生しない)。
@@ -2276,7 +2482,12 @@ test "transition_with_cache: Switch preserves wish_turns, replacement receives W
   let cache = new_damage_cache()
   // my[0] → my[1] へ Switch、opp は dummy Switch。Switch で wish は剥がれない。
   let outs = transition_with_cache(
-    state, ActionKind::Switch(1), ActionKind::Switch(0), team, team, cache,
+    state,
+    ActionKind::Switch(1),
+    ActionKind::Switch(0),
+    team,
+    team,
+    cache,
   )
   @debug.assert_eq(outs.length(), 1)
   let (_, new_state) = outs[0]
@@ -2338,9 +2549,7 @@ test "with_post_hit_effects: Wish by opp side — symmetric semantics" {
   let state = mk_wish_state()
   let team = [mk_wish_combatant(), mk_wish_combatant()]
   let mv = mk_wish_move()
-  let new_state = with_post_hit_effects(
-    state, false, 0, 0, team, team, mv, 0,
-  )
+  let new_state = with_post_hit_effects(state, false, 0, 0, team, team, mv, 0)
   @debug.assert_eq(new_state.opp_wish_turns, 2)
   @debug.assert_eq(new_state.my_wish_turns, -1)
 }
@@ -2375,11 +2584,7 @@ test "apply_eot: Wish on both sides triggers independently" {
 /// 場合は `add_hp_capped` でクランプされる。HP=80 + max/2=50 = 130 → 100。
 test "apply_eot: Wish heal caps at max_hp" {
   let mut state = mk_wish_state()
-  state = {
-    ..state,
-    my_hps: [80, 100],
-    my_wish_turns: 0,
-  }
+  state = { ..state, my_hps: [80, 100], my_wish_turns: 0 }
   let team = [mk_wish_combatant(), mk_wish_combatant()]
   let new_state = apply_eot(state, team, team)
   // 80 + 50 = 130 → cap 100
@@ -2396,10 +2601,7 @@ test "apply_eot: Wish heal caps at max_hp" {
 /// バグがあった。本テストでそれを Red 化する。
 test "Wish slot-bound semantics: Switch swaps receiver to replacement" {
   let mut state = mk_wish_state()
-  let my_team = [
-    mk_wish_combatant(max_hp=100),
-    mk_wish_combatant(max_hp=200),
-  ]
+  let my_team = [mk_wish_combatant(max_hp=100), mk_wish_combatant(max_hp=200)]
   let opp_team = [mk_wish_combatant(), mk_wish_combatant()]
   // my[0] が active で Wish 使用。HP は両者 50 から始めて遷移を観測しやすくする。
   state = { ..state, my_hps: [50, 50], opp_hps: [50, 50] }
@@ -2410,7 +2612,12 @@ test "Wish slot-bound semantics: Switch swaps receiver to replacement" {
   // Switch で my[1] (max=200) へ交代。Wish counter は保持。
   let cache = new_damage_cache()
   let outs = transition_with_cache(
-    state, ActionKind::Switch(1), ActionKind::Switch(0), my_team, opp_team, cache,
+    state,
+    ActionKind::Switch(1),
+    ActionKind::Switch(0),
+    my_team,
+    opp_team,
+    cache,
   )
   @debug.assert_eq(outs.length(), 1)
   let (_, state2_post_switch) = outs[0]
@@ -2422,11 +2629,7 @@ test "Wish slot-bound semantics: Switch swaps receiver to replacement" {
   // ScreenedSwitchingGame 側の責務)。
   // ここでは「もし wish_turns が 0 まで来たら、交代先 my[1] (max=200) が受け取る」
   // を直接 apply_eot で観察する。
-  let state2 = {
-    ..state2_post_switch,
-    my_wish_turns: 0,
-    my_hps: [50, 50],
-  }
+  let state2 = { ..state2_post_switch, my_wish_turns: 0, my_hps: [50, 50] }
   let final_state = apply_eot(state2, my_team, opp_team)
   // 受け取りは my_active=1 / max=200 → HP=50 + 100 = 150。
   @debug.assert_eq(final_state.my_hps[1], 150)
@@ -2488,10 +2691,10 @@ test "apply_eot: Sand+Wish leaves turn unchanged" {
 /// Combatant ヘルパー: 任意の moves と max_hp / spe を指定可能。real-path テスト
 /// で「Wish 使う側 my[0]」「交代先 my[1]」「opp 側 idle」を作り分ける。
 fn mk_wish_real_combatant(
-  name~ : String = "WishTest",
-  moves~ : Array[@model.Move] = [],
-  max_hp~ : Int = 100,
-  spe~ : Int = 100,
+  name? : String = "WishTest",
+  moves? : Array[@model.Move] = [],
+  max_hp? : Int = 100,
+  spe? : Int = 100,
 ) -> Combatant {
   let p : @model.Pokemon = {
     global_no: "0001",
@@ -2543,18 +2746,31 @@ fn mk_wish_real_combatant(
 /// なければならない。
 test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
   let wish_mv = mk_heal_move(
-    "ねがいごと", "ノーマル", @model.Status, 0, healing=Some(@model.Wish),
+    "ねがいごと",
+    "ノーマル",
+    @model.Status,
+    0,
+    healing=Some(@model.Wish),
   )
   let idle_mv = mk_heal_move("まもる", "ノーマル", @model.Status, 0)
   // my[0] / my[1] とも Wish + idle を持つ (UseMove(0) / UseMove(1) で参照可能に)。
   let my0 = mk_wish_real_combatant(
-    name="MyA", moves=[wish_mv, idle_mv], max_hp=100, spe=120,
+    name="MyA",
+    moves=[wish_mv, idle_mv],
+    max_hp=100,
+    spe=120,
   )
   let my1 = mk_wish_real_combatant(
-    name="MyB", moves=[wish_mv, idle_mv], max_hp=200, spe=80,
+    name="MyB",
+    moves=[wish_mv, idle_mv],
+    max_hp=200,
+    spe=80,
   )
   let opp0 = mk_wish_real_combatant(
-    name="OppA", moves=[idle_mv], max_hp=100, spe=60,
+    name="OppA",
+    moves=[idle_mv],
+    max_hp=100,
+    spe=60,
   )
   let my_team = [my0, my1]
   let opp_team = [opp0]
@@ -2580,7 +2796,9 @@ test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false],
+    opp_protean_locked: [""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -2590,7 +2808,12 @@ test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
   // Turn T: my[0] uses Wish, opp uses idle. EOT inside attempt_turn_with_cache
   // ticks the just-set wish_turns from 2 → 1; HP is unchanged this turn.
   let outs_t = attempt_turn_with_cache(
-    s0, UseMove(0), UseMove(0), my_team, opp_team, new_damage_cache(),
+    s0,
+    UseMove(0),
+    UseMove(0),
+    my_team,
+    opp_team,
+    new_damage_cache(),
   )
   @debug.assert_eq(outs_t.length(), 1)
   let (_, s1) = outs_t[0]
@@ -2600,7 +2823,12 @@ test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
   // Turn T+1: both sides idle. EOT ticks wish_turns 1 → 0 and atomically
   // fires the heal on the current active (my[0], max=100): 50 + 50 = 100.
   let outs_t1 = attempt_turn_with_cache(
-    s1, UseMove(1), UseMove(0), my_team, opp_team, new_damage_cache(),
+    s1,
+    UseMove(1),
+    UseMove(0),
+    my_team,
+    opp_team,
+    new_damage_cache(),
   )
   @debug.assert_eq(outs_t1.length(), 1)
   let (_, s2) = outs_t1[0]
@@ -2623,17 +2851,30 @@ test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
 /// は real turn-resolution path 経由で同じ契約を観測する。
 test "attempt_turn_with_cache: Switch threads Wish to replacement (real path)" {
   let wish_mv = mk_heal_move(
-    "ねがいごと", "ノーマル", @model.Status, 0, healing=Some(@model.Wish),
+    "ねがいごと",
+    "ノーマル",
+    @model.Status,
+    0,
+    healing=Some(@model.Wish),
   )
   let idle_mv = mk_heal_move("まもる", "ノーマル", @model.Status, 0)
   let my0 = mk_wish_real_combatant(
-    name="MyA", moves=[wish_mv, idle_mv], max_hp=100, spe=120,
+    name="MyA",
+    moves=[wish_mv, idle_mv],
+    max_hp=100,
+    spe=120,
   )
   let my1 = mk_wish_real_combatant(
-    name="MyB", moves=[wish_mv, idle_mv], max_hp=200, spe=80,
+    name="MyB",
+    moves=[wish_mv, idle_mv],
+    max_hp=200,
+    spe=80,
   )
   let opp0 = mk_wish_real_combatant(
-    name="OppA", moves=[idle_mv], max_hp=100, spe=60,
+    name="OppA",
+    moves=[idle_mv],
+    max_hp=100,
+    spe=60,
   )
   let my_team = [my0, my1]
   let opp_team = [opp0]
@@ -2659,7 +2900,9 @@ test "attempt_turn_with_cache: Switch threads Wish to replacement (real path)" {
     weather: @model.Weather::None,
     weather_turns_left: 0,
     my_leech_seeded: [false, false],
+    my_protean_locked: ["", ""],
     opp_leech_seeded: [false],
+    opp_protean_locked: [""],
     my_wish_turns: -1,
     opp_wish_turns: -1,
     field: @model.Field::None,
@@ -2668,7 +2911,12 @@ test "attempt_turn_with_cache: Switch threads Wish to replacement (real path)" {
   }
   // Turn T: my[0] uses Wish, EOT ticks 2 → 1.
   let outs_t = attempt_turn_with_cache(
-    s0, UseMove(0), UseMove(0), my_team, opp_team, new_damage_cache(),
+    s0,
+    UseMove(0),
+    UseMove(0),
+    my_team,
+    opp_team,
+    new_damage_cache(),
   )
   @debug.assert_eq(outs_t.length(), 1)
   let (_, s1) = outs_t[0]
@@ -2677,7 +2925,12 @@ test "attempt_turn_with_cache: Switch threads Wish to replacement (real path)" {
   // Turn T+1: my[0] → my[1] Switch, EOT ticks 1 → 0 and fires.
   // Receiver is the current active (= my[1], max=200): 50 + 100 = 150.
   let outs_t1 = attempt_turn_with_cache(
-    s1, Switch(1), UseMove(0), my_team, opp_team, new_damage_cache(),
+    s1,
+    Switch(1),
+    UseMove(0),
+    my_team,
+    opp_team,
+    new_damage_cache(),
   )
   @debug.assert_eq(outs_t1.length(), 1)
   let (_, s2) = outs_t1[0]
@@ -2742,7 +2995,10 @@ test "apply_eot: Sand chip skips いわ secondary type" {
 test "apply_eot: Sand chip skipped by マジックガード" {
   let mut state = mk_seed_state()
   state = { ..state, weather: @model.Sand, weather_turns_left: 5 }
-  let my_team = [mk_seed_combatant(ability="マジックガード"), mk_seed_combatant()]
+  let my_team = [
+    mk_seed_combatant(ability="マジックガード"),
+    mk_seed_combatant(),
+  ]
   let opp_team = [mk_seed_combatant(), mk_seed_combatant()]
   let new_state = apply_eot(state, my_team, opp_team)
   @debug.assert_eq(new_state.my_hps[0], 100)
@@ -2759,7 +3015,10 @@ test "apply_eot: Sand chip skipped by sand-related abilities (not すなおこ�
   let mut state = mk_seed_state()
   state = { ..state, weather: @model.Sand, weather_turns_left: 5 }
   let my_team = [mk_seed_combatant(ability="すなかき"), mk_seed_combatant()]
-  let opp_team = [mk_seed_combatant(ability="すなおこし"), mk_seed_combatant()]
+  let opp_team = [
+    mk_seed_combatant(ability="すなおこし"),
+    mk_seed_combatant(),
+  ]
   let new_state = apply_eot(state, my_team, opp_team)
   @debug.assert_eq(new_state.my_hps[0], 100) // すなかき で免疫
   @debug.assert_eq(new_state.opp_hps[0], 94) // すなおこし は免疫なし → max/16 減
@@ -2855,6 +3114,7 @@ test "apply_eot order: Leech precedes Status (BadPoison counter frozen on faint)
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     my_hps: [12, 100],
     my_status: [@model.BadPoison(3), @model.None],
   }
@@ -2886,6 +3146,7 @@ test "apply_eot order: Leech + Burn — opp gains max/8 regardless of fade" {
   state = {
     ..state,
     my_leech_seeded: [true, false],
+    my_protean_locked: ["", ""],
     my_hps: [12, 100],
     opp_hps: [50, 100],
     my_status: [@model.Burn, @model.None],
