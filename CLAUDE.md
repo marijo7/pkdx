@@ -21,8 +21,8 @@ CLIツール `pkdx` (MoonBit native binary) が pokedex.db への全クエリ、
     - 例（NG）: 〇〇なので✕✕すべきです
 2. ユーザーの情報を未確認のままupstreamへ送信してはならない。必ずremoteを確認し、送信対象が合っているかユーザーへ確認すること。
 3. 利用可能なポケモン、道具、技のプールを常にDBへ問い合わせ確認する。ユーザーが指定したフォーマット外の情報をフィードバックしてはならない
-    例: `Champions M-A` レギュレーション選択中に、準伝説ポケモンやサーフゴーを案内してしまう（M-Aフォーマット外）
-    例: `Champions M-A` レギュレーション選択中に、こだわりハチマキやとつげきチョッキを案内してしまう（M-Aフォーマット外）
+    例: `Champions M-B` レギュレーション選択中に、準伝説ポケモンやノココッチを案内してしまう（M-Bフォーマット外）
+    例: `Champions M-B` レギュレーション選択中に、こだわりハチマキやとつげきチョッキを案内してしまう（M-Bフォーマット外）
     例: DBデータからわからない場合は、ユーザーに許可をもらってから `WebSearch` を実行して最新の情報を取得する
 4. ダメージ計算に関しては必ず `pkdx damage` で計算してからフィードバックする。あなたが次に間違えやすい箇所
 5. タイプ相性に関しては必ず `pkdx type-chart` で計算してからフィードバックする。あなたが最も間違える箇所
@@ -238,7 +238,7 @@ SessionStart hook (`.claude/settings.json`) から呼ばれる 1-line JSON。
 | フィールド | 型 | 内容 |
 |---|---|---|
 | `version` | string | 現在の `box/regulation.json` の `version` (例: `"champions"`)。未設定時 `"champions"` |
-| `regulation` | string | 現在の `box/regulation.json` の `regulation` (例: `"M-A"`)。未設定時 `"M-A"` |
+| `regulation` | string | 現在の `box/regulation.json` の `regulation` (例: `"M-B"`)。未設定時 `"M-B"` |
 | `pkdx_version` | string | バイナリ build 時に焼き込まれた `version.mbt` の値 |
 | `repo_pkdx_version` | string | `moon.mod.json` の `version` を実行時に読んだ値。読めない場合は `""` |
 | `version_drift` | bool | `repo_pkdx_version != ""` かつ `repo_pkdx_version != pkdx_version` のとき `true`。`""` 比較は意図的に false 側 (silent) |
@@ -258,7 +258,7 @@ SessionStart hook (`.claude/settings.json`) から呼ばれる 1-line JSON。
 - **`.claude/skills/team-builder/references/format_rules.md`** — メガ/ダイマ/Z/テラスタル等のメカニクス定義
 - **`.claude/skills/team-builder/references/stat_thresholds.md`** — 種族値ベンチマーク・素早さティア
 - **`.claude/skills/team-builder/references/items_abilities.md`** — 道具・特性の考察用データ
-- **`.claude/skills/calc/references/special_cases.md`** — ダメージ計算の特殊パターン網羅。おやこあい / ばけのかわ / てんねん / Psyshock 系 / シェルアームズ / ボディプレス / せいなるつるぎ / ウェザーボール / 可変威力技 / 天候 (--weather 値域・ダメ補正・ステ補正・天候依存特性) / 壁 / 連続技 / 急所ランク無視 / JSON 出力フィールド。各項目に実装ファイル:行の根拠つき。`pkdx damage` のフラグが何をしているか迷ったらここを第一参照。
+- **`.claude/skills/calc/references/special_cases.md`** — ダメージ計算の特殊パターン網羅。デフォルト実数値 (攻撃側 SP32/EV252+性格1.1・防御側 SP0/EV0 無補正の攻防非対称) / おやこあい / ばけのかわ / てんねん / Psyshock 系 / シェルアームズ / ボディプレス / せいなるつるぎ / ウェザーボール / 可変威力技 / 天候 (--weather 値域・ダメ補正・ステ補正・天候依存特性) / 壁 / 連続技 / 半減実 (タイプ対応表・抜群ゲート・初撃のみ消費) / 急所ランク無視 / JSON 出力フィールド。各項目に実装ファイル:行の根拠つき。`pkdx damage` のフラグが何をしているか迷ったらここを第一参照。
 - **`.claude/skills/nash/references/theory.md`** — Layer 1 (零和 LP / Simplex / Fictitious play / MWU) は外部 repo `ushironoko/nash-mbt` (GitHub: pkdxtools/nash-mbt) に切り出し済み。pkdx 側からは shim として参照ポインタのみ残す。実装の正当性・数値安定性・退化ケースは新 repo の `docs/theory.md` を第一参照。
 - **`.claude/skills/nash/references/exploitability.md`** — Layer 1 (exploitability / NashConv / KL / L1) も同様に外部 repo へ移行。pkdx 側の shim は新 repo の `docs/exploitability.md` への参照ポインタ。
 - **`.claude/skills/nash/references/payoff_semantics.md`** — `TeamPayoffModel` (SwitchingGame / ScreenedSwitchingGame) の仕様・計算量・選択基準。pkdx ドメイン固有の Layer 2 のため pkdx 側に残す。選出最適化のどのモデルを使うべきか、廃止済みの pairwise 系に関する履歴もここ。
