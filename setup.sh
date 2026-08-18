@@ -232,12 +232,9 @@ if [ "$NEED_DOWNLOAD" = true ]; then
     fi
 
     if [ "$DOWNLOADED" = false ] && command -v curl &>/dev/null; then
-      RELEASE_URL=$(curl -sI "https://github.com/$REPO/releases/latest" | grep -i "^location:" | tr -d '\r' | sed 's/.*\///')
-      if [ -n "$RELEASE_URL" ]; then
-        URL="https://github.com/$REPO/releases/download/$RELEASE_URL/$BINARY_NAME"
-        if curl -sfL "$URL" -o "$BINARY" 2>/dev/null; then
-          DOWNLOADED=true
-        fi
+      URL="https://github.com/$REPO/releases/latest/download/$BINARY_NAME"
+      if curl -sfL "$URL" -o "$BINARY" 2>/dev/null; then
+        DOWNLOADED=true
       fi
     fi
 
