@@ -57,9 +57,18 @@ pub(all) enum ShardResult {
 } derive(Debug, Eq)
 
 ///|
+pub extend ShardResult with Debug::{to_repr}
+
+///|
+pub extend ShardResult with Eq::{not_equal, equal}
+
+///|
 pub suberror RunShardsError {
   InvalidInput(String)
 } derive(Debug)
+
+///|
+pub extend RunShardsError with Debug::{to_repr}
 
 ///|
 /// Spawn `argvs.length()` child processes, each invoking the running
@@ -94,7 +103,7 @@ pub fn run_parallel_shards(
   // Flatten argv: concatenate every argument's UTF-8 bytes, each
   // NUL-terminated. The C side walks the buffer with `strlen + 1`
   // strides to recover the individual argv slots.
-  let buf = @buffer.new()
+  let buf = Buffer()
   let shard_argc = FixedArray::make(n_shards, 0)
   for i in 0..<n_shards {
     let args = argvs[i]

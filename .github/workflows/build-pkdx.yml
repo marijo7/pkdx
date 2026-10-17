@@ -92,6 +92,23 @@ jobs:
           # Add OpenBLAS DLL dir to PATH for runtime resolution during moon test.
           Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
 
+      - name: Patch MoonBit runtime for MinGW (Windows)
+        # moon 0.1.20260920 ships lib/runtime/env.c, which calls rand_s() on
+        # every non-MSVC Windows build. mingw-w64's <stdlib.h> only declares
+        # rand_s when _CRT_RAND_S is defined before the include, so the
+        # MinGW gcc pinned below fails with "implicit declaration of
+        # function 'rand_s'". env.c does define _CRT_RAND_S itself, but only
+        # after <stdlib.h> has already been pulled in, so it has no effect.
+        # Prepend the define as the very first line until upstream moves it.
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          f="$HOME/.moon/lib/runtime/env.c"
+          if [ "$(head -1 "$f")" != "#define _CRT_RAND_S" ]; then
+            printf '#define _CRT_RAND_S\n' | cat - "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          fi
+          head -3 "$f"
+
       - name: Configure MoonBit compiler (Windows)
         # MoonBit's native backend reads MOON_CC for compiler override (NOT the
         # conventional CC); without it, auto-detection picks cl.exe (MSVC) on
