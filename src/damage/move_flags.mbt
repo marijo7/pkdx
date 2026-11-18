@@ -47,13 +47,27 @@ let pulse_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
   [
     "はどうだん", "あくのはどう", "みずのはどう", "りゅうのはどう",
     "だいちのはどう", "いやしのはどう", "こんげんのはどう",
-    "てっていこうせん",
   ].iter(),
 )
 
 ///|
 pub fn is_pulse_move(name : String) -> Bool {
   pulse_moves.contains(name)
+}
+
+///|
+/// 命中 / 無効化時に使用者が最大 HP の 1/2 を失う技 (Showdown `mindBlownRecoil`)。
+/// てっていこうせん のみ: Champions `wazainfo_syn.json:13644` "After attacking,
+/// the user takes damage equal to 1/2 of its max HP." / Showdown `data/moves.ts`
+/// steelbeam (`mindBlownRecoil` + `onMoveFail`)。マインドブロウ は Champions 非収録
+/// (`waza.json` available=0) のため含めない。
+let max_hp_recoil_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  ["てっていこうせん"].iter(),
+)
+
+///|
+pub fn is_max_hp_recoil_move(name : String) -> Bool {
+  max_hp_recoil_moves.contains(name)
 }
 
 ///|
@@ -69,6 +83,21 @@ let recoil_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
 ///|
 pub fn is_recoil_move(name : String) -> Bool {
   recoil_moves.contains(name)
+}
+
+///|
+/// 崩れ技 (Showdown `hasCrashDamage` + `onMoveFail`): 命中しなかった (外れ / タイプ・
+/// 特性で無効) とき、使用者が最大 HP の 1/2 を失う。対象は data/moves.ts の highjumpkick
+/// (とびひざげり) / jumpkick (とびげり, Past) / axekick (かかとおとし) /
+/// supercellslam (サンダーダイブ)。Mind Blown / Steel Beam は丸め (Math.round) と
+/// multihit の扱いが異なり、pokedex.db にも champions.db にも無いので含めない。
+let crash_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  ["とびひざげり", "とびげり", "かかとおとし", "サンダーダイブ"].iter(),
+)
+
+///|
+pub fn is_crash_move(name : String) -> Bool {
+  crash_moves.contains(name)
 }
 
 ///|
@@ -177,6 +206,54 @@ pub fn is_contact_move(name : String) -> Bool {
 }
 
 ///|
+/// くさタイプの技のうち、ターゲットに相手ポケモンを含まないもの (自分 / 自分側 /
+/// 味方 / フィールドに作用する)。DB の表記 (`pokedex.db` `local_waza`) で列挙する。
+/// 出典: champions `move.target` (7 = 自分、10 = フィールド全体) が付く
+/// こうごうせい / せいちょう / ねをはる / コットンガード / ニードルガード /
+/// グラスフィールド、および説明文に味方・てもちへの作用が書かれている
+/// アロマセラピー (てもちのすべてのポケモン) / ジャングルヒール (じぶんとばにいる
+/// みかた)。そうしょく (Sap Sipper) は自分を狙う技だけを吸収するので、これらは対象外。
+let grass_non_foe_target_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  [
+    "こうごうせい", "せいちょう", "ねをはる", "コットンガード",
+    "ニードルガード", "グラスフィールド", "アロマセラピー", "ジャングルヒール",
+  ].iter(),
+)
+
+///|
+/// `true` when the Grass-type move `name` never targets the opposing Pokémon
+/// (see `grass_non_foe_target_moves`). The caller checks the move type itself.
+pub fn is_grass_non_foe_target_move(name : String) -> Bool {
+  grass_non_foe_target_moves.contains(name)
+}
+
+///|
+/// 吸収特性 (ちくでん / ちょすい / かんそうはだ / でんきエンジン / ひらいしん /
+/// もらいび / そうしょく) が相手を狙っていないので吸収しない技。
+/// champout `50e7233` `masterdata/waza.json` の `available=1` で、該当タイプかつ
+/// 相手ポケモンを対象にしない target:
+///   - 7 自分: アクアリング / じゅうでん / でんじふゆう
+///   - 6 味方: いのちのしずく / じばそうさ
+///   - 10 フィールド: あまごい / にほんばれ / エレキフィールド
+///   - 11 相手側: まきびし
+/// くさ側は `is_grass_non_foe_target_move` (target 7 / 10 と、てもち・味方の説明文)。
+let absorb_non_foe_target_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  [
+    "アクアリング", "あまごい", "いのちのしずく", "じゅうでん", "でんじふゆう",
+    "エレキフィールド", "じばそうさ", "にほんばれ", "まきびし",
+  ].iter(),
+)
+
+///|
+/// `true` when `name` does not target the opposing Pokémon, so an absorb
+/// ability must not nullify it. Grass names stay in
+/// `is_grass_non_foe_target_move`; this is the union used by the payoff absorb
+/// check.
+pub fn is_absorb_non_foe_target_move(name : String) -> Bool {
+  is_grass_non_foe_target_move(name) || absorb_non_foe_target_moves.contains(name)
+}
+
+///|
 /// Resolve the move's effective contact flag, honoring `force_contact` from
 /// `StatResolution` (シェルアームズ 物理モード等の動的接触判定) over the
 /// static `is_contact_move` table. Shared by the damage engine and the
@@ -223,4 +300,55 @@ let spread_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
 ///|
 pub fn is_spread_move(name : String) -> Bool {
   spread_moves.contains(name)
+}
+
+///|
+/// こおり (Freeze) の解凍に関わる技名リスト。Champions 本文を優先し、本文が黙る技は
+/// Showdown `data/moves.ts` の `flags.defrost` / `thawsTarget` で補う。
+/// - 使用者の解凍 (defrost): 本文 "Cures the user of being frozen" を持つ フレアドライブ
+///   (help_11_04_01 系 wazainfo_syn.json:7480) / かえんボール (:13396) / もえつきる (:12460,
+///   炎タイプ使用者のみ) / ねっとう (:9816) / ねっさのだいち (:14386)。シャカシャカほう (:15924)
+///   は本文が黙るので Showdown `defrost` で補う。残りは Showdown `defrost` で Champions 外も含む。
+let defrost_user_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  [
+    "かえんぐるま", "せいなるほのお", "フレアドライブ", "かえんボール",
+    "もえつきる", "クロスフレイム", "ねっとう", "ねっさのだいち",
+    "スチームバースト", "シャカシャカほう",
+  ].iter(),
+)
+
+///|
+pub fn is_defrost_user_move(name : String) -> Bool {
+  defrost_user_moves.contains(name)
+}
+
+///|
+/// 命中で相手の こおり を解除する技 (Showdown `thawsTarget` / 本文 "Cures the user and
+/// target of being frozen": ねっとう (:9816) / ねっさのだいち (:14386))。シャカシャカほう は
+/// 本文が黙るので Showdown `thawsTarget` で補う。スチームバースト は Champions 外。
+let thaws_target_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  ["ねっとう", "ねっさのだいち", "スチームバースト", "シャカシャカほう"].iter(),
+)
+
+///|
+pub fn is_thaws_target_move(name : String) -> Bool {
+  thaws_target_moves.contains(name)
+}
+
+///|
+/// 粉技。champout `50e7233` `masterdata/waza.json` の
+/// `classification_a` / `classification_b` == `"6"`
+/// （`wazaclassification` Index 5 が粉。値は 1 始まりで、5 は風）。
+/// available=0 の キノコのほうし / ふんじん も分類は粉なので含める。
+/// くさ無効とぼうじんは payoff の `powder_move_blocked`。
+let powder_moves : @hashset.HashSet[String] = @hashset.HashSet::from_iter(
+  [
+    "どくのこな", "しびれごな", "ねむりごな", "キノコのほうし", "わたほうし",
+    "いかりのこな", "ふんじん", "まほうのこな",
+  ].iter(),
+)
+
+///|
+pub fn is_powder_move(name : String) -> Bool {
+  powder_moves.contains(name)
 }

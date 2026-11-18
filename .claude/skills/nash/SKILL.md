@@ -46,7 +46,7 @@ NOT_FOUND の場合は以下を案内してスキルを終了:
 ```
 pkdx CLI が見つかりません。リポジトリルートで以下を実行:
   ./setup.sh
-  moon build --target native src/main
+  bash scripts/moon_build_native.sh
 ```
 
 ## Phase 1: タスク選択 (AskUserQuestion)
@@ -65,9 +65,9 @@ pkdx CLI が見つかりません。リポジトリルートで以下を実行:
 |---|------|--------|-----------|
 | 1 | 入力の種類は？ | 入力形式 | 行列を直接入力 (matrix), monocycle character (p, v) リスト (characters) |
 
-**matrix 形式**: n×n の実数行列。対称・反対称を問わない。零和にしたい場合は `A[j,i] = -A[i,j]` を自前で設定するか、monocycle 形式を使う。
+**matrix 形式**: m×n の実数行列（1×N / N×1 を含む）。正方でなくてよい。入力は行プレイヤーの利得で、ソルバは列プレイヤーの利得を `-A` とする零和ゲームとして解く。simplex が iteration limit（`SimplexFailure`）で止まった場合、または有限な行列なのに数値誤差で `InconsistentGame` になった場合は、正方と同じく fictitious play → MWU に fallback する。各行の長さは n で揃える。0 行・0 列の空行列と、行の長さが揃っていない入力はエラー。`labels` の長さは行数 m。m = n のとき、このラベルは列の行動にも同じ順で対応する。m ≠ n のとき、列の行動は `col_strategy` と `support.col` の index で参照する。
 
-**characters 形式**: 各キャラに `label` (名前)、`power` (スカラー p)、`v` (2D ベクトル {x, y})。利得は `A[i,j] = (pᵢ − pⱼ) + vᵢ × vⱼ` で自動生成。
+**characters 形式**: 各キャラに `label` (名前)、`power` (スカラー p)、`v` (2D ベクトル {x, y})。利得は `A[i,j] = (pᵢ − pⱼ) + vᵢ × vⱼ` で自動生成され、キャラ数の正方行列になる。
 
 ### 実行
 
@@ -101,10 +101,13 @@ JSON
   "row_strategy": [0.333, 0.333, 0.333],
   "col_strategy": [0.333, 0.333, 0.333],
   "exploitability": 0,
+  "nash_solver": "simplex",
   "support": {"row": [0, 1, 2], "col": [0, 1, 2]},
   "labels": ["R", "P", "S"]
 }
 ```
+
+`nash_solver` は解を返した経路 (`simplex` / `fictitious_play` / `mwu`)。simplex が iteration limit（`SimplexFailure`）で止まった場合、または有限な行列なのに数値誤差で `InconsistentGame`（col LP unbounded など）になった場合は fictitious play に切り替わり、その exploitability が tol 以上なら mwu に進む。空行列や NaN/Inf は行列構築時に拒否され、fallback しない。tol の既定は 0.05、反復回数の既定は 10000。入力の `nash_solver_config.tol` と `nash_solver_config.iterations` で上書きできる。両方とも tol を超えたときはコマンドが失敗する。pure-saddle は simplex 経路の内側で返り、`nash_solver` は `simplex` のまま。simplex が成功したときの value・戦略・exploitability は変わらない。
 
 ### 結果整形
 
@@ -113,6 +116,7 @@ JSON
 
 - **ゲーム値**: {value}
 - **exploitability**: {exploitability} (< 1e-6 なら厳密解とみなしてよい)
+- **solver**: {nash_solver}
 
 ### 行プレイヤーの混合戦略
 | index | label | 確率 |
@@ -155,10 +159,10 @@ ls box/teams/*.meta.json
 
 #### モデル選択肢 (`team_payoff_model` フィールド)
 
-- `"switching_game"` (既定) — 交代込み extensive-form ゲーム木。DP turn_limit=5 既定 (先制技 / ランク補正技に対応)。長期戦評価が必要なら `"switching_game:<N>"` で turn_limit を上書き可
+- `"switching_game"` (既定) — 交代込み extensive-form ゲーム木。DP turn_limit=5 既定 (先制技 / ランク補正技に対応)。ただし turn_limit=5 は自動昇格閾値 (`N >= 4`) 以上のため、実行時は下記「CLI 側の自動フォールバック」により screening 版に置き換わる。長期戦評価が必要なら `"switching_game:<N>"` で turn_limit を上書き可
 - `"screened_switching_game:<trials>:<seed>:<keep_top>"` — MC で選出行列を screening (rollout turn_limit=5)、下位を quantile cutoff で枝刈り、残存 sub-matrix だけ SwitchingGame DP (refine turn_limit=5 既定)。例: `"screened_switching_game:1000:42:0.3"`。パラメータを細かくチューニングしたいときだけ明示指定する
 
-**CLI 側の自動フォールバック**: `switching_game:<N>` で `N >= 5` のとき、`pkdx select` は内部で `ScreenedSwitchingGame(trials=1000, seed=42, keep_top=0.3, refine_turn_limit=N)` に自動昇格する。skill 側で screening をどう使うか判断する必要はなく、常に `switching_game:<N>` で turn_limit だけ指定すればよい。明示的に `screened_switching_game:...` を書いた場合はそのまま使われる。
+**CLI 側の自動フォールバック**: `switching_game:<N>` で `N >= 4` のとき、`pkdx select` は内部で `ScreenedSwitchingGame(trials=1000, seed=42, keep_top=0.3, refine_turn_limit=N)` に自動昇格する。skill 側で screening をどう使うか判断する必要はなく、常に `switching_game:<N>` で turn_limit だけ指定すればよい。明示的に `screened_switching_game:...` を書いた場合はそのまま使われる。
 
 詳細は `references/payoff_semantics.md`。
 
@@ -182,14 +186,14 @@ ls box/teams/*.meta.json
 
 **エンコード**:
 
-- 基本は `"switching_game:<N>"` を組み立てるだけでよい。`N >= 5` のとき CLI が内部で screening 版に自動昇格するので、skill 側で `screened_switching_game:...` を構築する必要はない
+- 基本は `"switching_game:<N>"` を組み立てるだけでよい。`N >= 4` のとき CLI が内部で screening 版に自動昇格するので、skill 側で `screened_switching_game:...` を構築する必要はない
 - screening パラメータ (`trials`/`seed`/`keep_top`) をユーザーが明示的に変更したい場合のみ `"screened_switching_game:<trials>:<seed>:<keep_top>:<N>"` を直接指定する
 
 ### 実行
 
 #### 1. 入力 JSON をファイルへ保存
 
-実行主体に関わらず、入力 JSON はまず `/tmp/pkdx_select_input.json` に書き出す (ユーザー手動ルートでも同じファイルを参照させるため heredoc ではなくファイル経由に統一する)。技の priority / stat_effects は `pkdx moves` 出力をそのまま流せる。省略時はデフォルト (priority=0 / stat_effects=[]) 扱い。
+実行主体に関わらず、入力 JSON はまず `/tmp/pkdx_select_input.json` に書き出す (ユーザー手動ルートでも同じファイルを参照させるため heredoc ではなくファイル経由に統一する)。技の priority / stat_effects / status_effect / flinch_chance / recoil_num・recoil_den / self_ko / recharge / heal_kind 系 / weather_set / field_set は `pkdx moves` 出力をそのまま流せる。省略時はデフォルト (priority=0 / stat_effects=[] / 状態異常なし / flinch_chance=0 / 反動なし / self_ko・recharge=false / 回復なし / 天候・フィールド設定なし) 扱い。`status_effect` は `{"kind":"やけど","chance":10}` の形、`flinch_chance` は ひるみ率 (%) の整数。トップレベルの `my_fresh` / `opp_fresh` (bool、省略可) はねこだまし用で、省略時は未追跡 (失敗もひるみも掛けない)。バトル開始のリードでねこだましを撃たせるときは `true` を入れる。select は毎選択をターン 1 とは扱わない。`heal_kind` は fixed / weather / drain / rest / leech_seed / pain_split / wish のいずれか (数値は `heal_num` / `heal_den`、weather のみ `heal_sunny_*` / `heal_harsh_*` も)。`weather_set` は sun / rain / sand / snow、`field_set` は electric / grassy / misty / psychic。崩れ技 (とびひざげり 等) とてっていこうせんの反動は名前で判定されるのでキー不要。
 
 ```bash
 cat > /tmp/pkdx_select_input.json <<'JSON'
@@ -361,9 +365,11 @@ JSON
 
 3 種類の入力を受け付ける:
 
-1. **matrix 形式**: 既知の利得行列を直接渡す
-2. **characters 形式**: monocycle (p, v) リストから自動生成
+1. **matrix 形式**: 既知の正方利得行列を直接渡す
+2. **characters 形式**: monocycle (p, v) リストから自動生成（正方）
 3. **team + opponent 形式**: `pkdx select` と同じ Combatant JSON。`box/teams/*.meta.json` の `members` をそのまま流せる
+
+matrix / characters 形式は正方だけを受け付ける。DOT はノード集合が 1 つの有向グラフで、辺 `i -> j` のラベルが `A[i, j]`、両端が同じ `labels` を共有する。非正方は行と列で行動集合が違うのでこのグラフにはならない。矩形の零和は `pkdx nash solve` に渡す。team + opponent 形式は `(n+m) × (n+m)` の正方に埋め込んでから描くので、人数が違っても渡せる。
 
 ```bash
 # matrix 形式
@@ -406,7 +412,9 @@ dot -Tpng matchup.dot -o matchup.png
 | `invalid JSON: ...` | 入力 JSON の構文エラー。再入力を依頼 |
 | `missing field: ...` | 必須フィールド不足。仕様を再提示して再入力 |
 | `both matrix and characters provided; pick one` | どちらか一方を削除 |
-| `matrix is not square: NxM` | 正方行列に修正 |
+| `matrix is not square: RxC` | `nash graph` の matrix / characters が非正方。正方にするか、矩形の零和は `nash solve` に渡す |
+| `invalid JSON: matrix rows have inconsistent lengths: ...` | 各行の要素数を揃える |
+| `invalid JSON: matrix must be non-empty` | 0 行または 0 列の行列は受け付けない |
 | `usage does not sum to 1 (got X)` | 使用率を正規化し直す |
 | `game is infeasible` / `unbounded` | 入力が退化 (LP が解けない)。対角/反対称性を確認 |
 

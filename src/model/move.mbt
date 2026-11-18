@@ -1,7 +1,8 @@
 ///|
 /// Stat-rank change produced by a move. `target` picks whose ranks get the
 /// delta: `0` = self (attacker), `1` = opponent (defender). The `delta` is
-/// added and clamped in `[-2, +2]` by the payoff layer (`clamp_rank`).
+/// added and clamped by the payoff layer (`clamp_rank_for`): `[-2, +2]`, or
+/// `[-6, +6]` for the holder of まけんき / かちき.
 ///
 /// つるぎのまい — `[{stat:0, delta:2, target:0}]` (+2 Atk self)
 /// あまえる     — `[{stat:0, delta:-2, target:1}]` (-2 Atk opp)
@@ -32,12 +33,13 @@ pub extend StatEffect with Hash::{hash, hash_combine}
 /// - `FixedFraction(n, d)` — restore `max_hp * n / d` (じこさいせい = (1, 2))
 /// - `WeatherDependent(default_n, default_d, sunny_n, sunny_d, harsh_n, harsh_d)` —
 ///   pick fraction by current weather (Sun → sunny, Rain/Sand/Snow → harsh,
-///   None → default). つきのひかり / あさのひざし / シンセシス all share
+///   None → default). つきのひかり / あさのひざし / こうごうせい all share
 ///   the (1,2) / (2,3) / (1,4) triple.
 /// - `Drain(n, d)` — restore `dmg_dealt * n / d` (ギガドレイン = (1, 2)).
 ///   `defender.ability == "ヘドロえき"` reverses the sign (attacker takes
 ///   damage instead) — handled by the payoff layer, not encoded here.
-/// - `Rest` — full HP restore + self-Sleep(2). Fails (no HP / status change)
+/// - `Rest` — full HP restore + self-`RestSleep(2)` (no 1/3 wake check on the
+///   2nd turn). Fails (no HP / status change)
 ///   when the user is already at full HP, mirroring mainline behavior.
 ///   `Sleep` immunity abilities (ふみん / やるき / スイートベール) also
 ///   block the entire effect.
@@ -81,10 +83,16 @@ pub extend HealingEffect with Hash::{hash, hash_combine}
 ///   self-target and opponent-target entries mix freely; the payoff layer
 ///   routes each entry by its `target` field. Empty for damaging-only moves
 ///   that have no rank side effects.
-/// - `status_effect` — optional `(StatusKind, chance%)` pair for dedicated
-///   status moves (鬼火 = `Some((BurnKind, 85))`, どくどく, ねむりごな等).
-///   Secondary chances on damaging moves (ほのおのパンチ 10%やけど 等) are
-///   not modelled in MVP — only dedicated status moves carry this field.
+/// - `status_effect` — optional `(StatusKind, chance%)` pair. Two uses share
+///   the field, and the chance means something different for each:
+///   - pure status moves (鬼火 = `Some((BurnKind, 100))`, どくどく, ねむりごな等):
+///     the chance is the infliction chance *after* the accuracy roll, so it is
+///     100 when the DB is the source (`normalize_status_effect_chance`). A JSON
+///     input may still set it below 100 (see payoff_semantics.md).
+///   - damaging moves with a secondary status (ほのおのパンチ 10% やけど,
+///     ヘドロばくだん 30% どく 等; こおり: れいとうビーム 10%): the chance is the
+///     per-hit secondary chance, rolled only when the hit reduces the target's HP
+///     (a Disguise chip counts; `secondary_gated_move`).
 ///
 /// Post-hit side-effect fields are covered below. All payoff metadata fields
 /// default to neutral values (`0` / `[]` / `None` / `false` / recoil `(0, 1)`)
@@ -141,6 +149,12 @@ pub(all) struct Move {
   healing : HealingEffect?
   weather_set : Weather?
   field_set : Field?
+  // `flinch_chance` — per-hit ひるみ chance (%) of a damaging move (Champions
+  // wazainfo_syn.json の「N% chance of making the target flinch」)。0 = ひるみなし。
+  // 命中して相手が生存したときだけ抽選し、成功すると相手はそのターンの後攻の行動を
+  // 失う (持ち越さない)。DB では move_meta.flinch_chance (m019) から入る。
+  // ゲート (ちからずく / せいしんりょく / りんぷん / HP 減少なし) は payoff 層で掛ける。
+  flinch_chance : Int
 } derive(Debug, Eq)
 
 ///|

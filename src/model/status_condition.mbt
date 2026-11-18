@@ -2,13 +2,29 @@
 /// Runtime status condition carried by each team slot. `None` is the default
 /// (no condition). `BadPoison(n)` counts how many end-of-turn ticks have
 /// already elapsed: the next tick deals `min(n + 1, 15) / 16 * max_hp`.
-/// `Sleep(n)` is the number of remaining unable-to-act turns — the switching-
-/// game DP decrements it each turn and flips back to `None` when it reaches
-/// zero.
+/// `Sleep(n)` is the ねむり counter of a non-Rest sleep (ねむり技 / あくび).
+/// Every move attempt by the sleeper decrements it (`per_side_attempt`):
+/// - `n >= 2`: asleep for sure (Champions: "remain asleep on its first turn").
+/// - `n == 1`: 1/3 wake up and act (subject to accuracy), 2/3 stay asleep
+///   (Champions: "1-in-3 chance of being cured on its second turn").
+/// - `n == 0`: wake up and act (subject to accuracy) — "cured on its third turn".
+/// `RestSleep(n)` is the same counter for a sleep started by the move Rest.
+/// It has no 1/3 check: asleep while `n >= 1`, wake and act at `n == 0`
+/// (Champions: "has no chance of being cured until its third turn").
+/// `Freeze(n)` is the こおり counter (help_syn.json:26184). A frozen side's
+/// move attempt is a try: while `n >= 1` it is cured and acts with 25%
+/// (`FREEZE_THAW_RATE`, "has a 25% chance of being cured each time it tries"),
+/// else it stays frozen with `Freeze(n - 1)`; `Freeze(0)` is cured on its
+/// third try ("cured on its third turn after becoming frozen") and acts
+/// (accuracy applies). A defrost move used by the frozen user cures it before
+/// the move (no roll). Ice-type Pokemon cannot be frozen.
 ///
 /// Counter semantics on switch:
 /// - `BadPoison(n)` resets to `BadPoison(0)` (fresh 1/16 on the next tick).
-/// - `Sleep(n)` persists (switched-out sleeper keeps counting elsewhere).
+/// - `Sleep(n)` / `RestSleep(n)` / `Freeze(n)` persist unchanged. The counter
+///   only moves on a move attempt by the active sleeper / freezer, so a benched
+///   one is frozen (Showdown `slp` behaves the same; Champions text is silent
+///   on switching).
 /// - `Paralyze` / `Burn` / `Poison` are stateless flags, unchanged by switch.
 pub(all) enum StatusCondition {
   None
@@ -17,6 +33,11 @@ pub(all) enum StatusCondition {
   Poison
   BadPoison(Int)
   Sleep(Int)
+  // 技「ねむる」由来の眠り。カウンタの意味は Sleep と同じだが、2 ターン目の
+  // 1/3 の目覚め抽選を持たない (Champions「ねむるは 3 ターン目まで回復しない」)。
+  RestSleep(Int)
+  // こおり (Champions "Frozen"). Counter semantics: see the type doc above.
+  Freeze(Int)
   // あくび専用: ねむり予告マーカー。N ターン後の EOT に Sleep(2) へ遷移する。
   // 初期値 `Drowsy(1)`: 付与ターンの EOT で `Drowsy(0)` に、次の EOT で
   // `Sleep(2)` に変わる (合計 1 ターン猶予 = 本家の遅延ねむり)。交代すると
@@ -44,6 +65,8 @@ pub(all) enum StatusKind {
   PoisonKind
   BadPoisonKind
   SleepKind
+  // こおり (Frozen). Counter starts at `Freeze(2)` (see `inflict_status`).
+  FreezeKind
   // あくびが付与する予告状態。直接ねむりを与えず 1 ターン遅延させる。
   DrowsyKind
 } derive(Debug, Eq, Hash)
@@ -67,16 +90,33 @@ pub fn status_kind_from_jp(name : String) -> StatusKind? {
     "どく" => Some(PoisonKind)
     "もうどく" => Some(BadPoisonKind)
     "ねむり" => Some(SleepKind)
+    "こおり" => Some(FreezeKind)
     "あくび" => Some(DrowsyKind)
     _ => None
   }
 }
 
 ///|
+/// `status_kind_from_jp` の逆変換。`pkdx moves` の JSON (`status_effect.kind`) に使う
+/// 和名を返す。`status_kind_from_jp(status_kind_to_jp(k)) == Some(k)` が全 kind で成り立つ
+/// (`status_condition_wbtest.mbt` で確認)。
+pub fn status_kind_to_jp(kind : StatusKind) -> String {
+  match kind {
+    ParalyzeKind => "まひ"
+    BurnKind => "やけど"
+    PoisonKind => "どく"
+    BadPoisonKind => "もうどく"
+    SleepKind => "ねむり"
+    FreezeKind => "こおり"
+    DrowsyKind => "あくび"
+  }
+}
+
+///|
 /// Build the initial `StatusCondition` produced when a move of the given kind
-/// lands. `Sleep` starts with 2 remaining turns (fixed in MVP; gen-accurate
-/// 1–3 randomisation is a future extension). `BadPoison` starts at counter 0,
-/// so the first end-of-turn tick deals `1/16 * max_hp`.
+/// lands. `Sleep` starts at counter 2 (Champions: the first move attempt after
+/// falling asleep is a sure skip; see `StatusCondition`). `BadPoison` starts at
+/// counter 0, so the first end-of-turn tick deals `1/16 * max_hp`.
 pub fn inflict_status(kind : StatusKind) -> StatusCondition {
   match kind {
     ParalyzeKind => Paralyze
@@ -84,6 +124,8 @@ pub fn inflict_status(kind : StatusKind) -> StatusCondition {
     PoisonKind => Poison
     BadPoisonKind => BadPoison(0)
     SleepKind => Sleep(2)
+    // こおり: 1 回目と 2 回目の試行は 25% で解凍して行動、3 回目で確定解凍 (Freeze(2) → Freeze(0))。
+    FreezeKind => Freeze(2)
     // あくび付与時は Drowsy(1)。最初の EOT で Drowsy(0)、次の EOT で Sleep(2)。
     DrowsyKind => Drowsy(1)
   }
@@ -106,6 +148,7 @@ pub fn status_condition_from_cli_str(s : String) -> StatusCondition {
     "badpoison" | "bad-poison" | "badly-poisoned" | "もうどく" =>
       BadPoison(0)
     "sleep" | "asleep" | "ねむり" => Sleep(2)
+    "freeze" | "frozen" | "こおり" => Freeze(2)
     "drowsy" | "あくび" => Drowsy(1)
     _ => None
   }
@@ -126,6 +169,8 @@ pub fn immune_to_status(
       type1 == "どく" ||
       type2 == "どく"
     SleepKind => false
+    // こおりは こおりタイプ (本文 help_syn.json:23193 "Ice Types ・ Cannot be frozen") のみ免疫。
+    FreezeKind => type1 == "こおり" || type2 == "こおり"
     // あくびはタイプ免疫なし。ねむり粉系 (ねむりごな等) と異なり草タイプにも
     // 効く。特性免疫 (ふみん/やるき/スイートベール) は別タスクで対応。
     DrowsyKind => false

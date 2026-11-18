@@ -66,6 +66,7 @@ fn asv_move(
     healing: None,
     weather_set: None,
     field_set: None,
+    flinch_chance: 0,
   }
 }
 
@@ -112,6 +113,10 @@ fn asv_state(my_hp : Int, opp_hp : Int) -> SwitchingGameState {
     my_disguise_busted: [false],
     opp_item_consumed: [false],
     opp_disguise_busted: [false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -124,6 +129,8 @@ fn asv_state(my_hp : Int, opp_hp : Int) -> SwitchingGameState {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }

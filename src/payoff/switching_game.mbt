@@ -22,7 +22,8 @@
 ///|
 /// Immutable state of a `SwitchingGame`: which Pokemon is active on each
 /// side, HPs for all Pokemon, stat ranks of the current actives (clamped to
-/// `[-2, +2]` per the payoff-layer convention, reset on switch), and turn
+/// `[-2, +2]` per the payoff-layer convention; まけんき / かちき holders use
+/// `[-6, +6]`, see `clamp_rank_for`; reset on switch), and turn
 /// counter. Used as a `HashMap` key for the memoized `value` recursion.
 ///
 /// `my_ranks` / `opp_ranks` have length 5: `[A, B, C, D, S]` (see
@@ -58,7 +59,8 @@ pub(all) struct SwitchingGameState {
   opp_must_recharge : Array[Bool]
   // P5 (#97): per-slot held-item consumption flag. Set to `true` once the
   // slot's held item triggers (resist berry weakness reduction, きあいのタスキ
-  // KO survival, フィラのみ HP heal). Persists across switches — a consumed
+  // KO survival, フィラのみ HP heal, しろいハーブ negative-stage reset — see
+  // `held_item_stat_reset.mbt`). Persists across switches — a consumed
   // berry doesn't reappear when the holder switches back in. Length = team
   // size; aligns with my_megaed / my_status indexing.
   my_item_consumed : Array[Bool]
@@ -139,6 +141,25 @@ pub(all) struct SwitchingGameState {
   //   not modeled in this PR). When 0 the next EOT clears to `None`.
   field : @model.Field
   field_turns_left : Int
+  // もらいび状態 (champout `50e7233` `BTR_STATE_SYN_121_02`: ほのお技の威力 1.5 倍)。
+  // slot ごと。炎技を吸収したとき true。交代で出ていく slot は false に戻す
+  // (Showdown の volatile。champout は継続ターン数を書かない)。メガでは消さない。
+  // 長さ 0 は未追跡 (false と同じ)。
+  my_flash_fire : Array[Bool]
+  opp_flash_fire : Array[Bool]
+  // ひるみ (Champions wazainfo_syn.json の「N% chance of making the target flinch」) のターン内
+  // フラグ。先攻の技が命中して相手が生存し、ひるみ抽選に当たると相手側を true にする。後攻の
+  // 試行はこのフラグを行動時点で読み、true なら行動しない (`flinched_outcomes`)。ターン末
+  // (`attempt_turn_with_cache` の出口) で必ず false に戻すので、ひるみは持ち越さない。
+  // ターン外の状態では常に false (DP のキャッシュ鍵もこの前提で同一になる)。
+  my_flinched : Bool
+  opp_flinched : Bool
+  // ねこだまし (WAZAINFO_SYN_252) の「登場後の最初の技」ゲート。
+  // `None` は未指定 (select の既定)。失敗もひるみも掛けず、交代しても None のまま。
+  // バトル開始のリードで撃たせるときは呼び出し側が Some(true) を渡す。
+  // 詳細は fake_out.mbt。
+  my_fresh : Bool?
+  opp_fresh : Bool?
   turn : Int
 } derive(Debug, Eq, Hash)
 
@@ -237,11 +258,17 @@ fn last_resort_barred(
 /// to tick without an act. The `post_status` field carries the active slot's
 /// status after this attempt resolves (pre-EOT-tick), so the caller can
 /// thread it into the resulting next-state.
+///
+/// `miss` is `true` only for the accuracy-miss branch (a move that was used and
+/// missed). Sleep / paralysis skips and recharge leave it `false`, because only
+/// a missed move reaches Showdown's `MoveFail` (the crash of 崩れ技 and the
+/// recoil of てっていこうせん).
 pub(all) struct SideAttempt {
   prob : Double
   acts : Bool
   action : ActionKind
   post_status : @model.StatusCondition
+  miss : Bool
 } derive(Debug)
 
 ///|
@@ -742,6 +769,8 @@ fn compute_mean_damage(
   field? : @model.Field = @model.Field::None,
   protean_consumed? : Bool = false,
   def_disguise_intact? : Bool = false,
+  atk_flash_fire? : Bool = false,
+  def_flash_fire? : Bool = false,
 ) -> Int {
   weighted_mean_floor(
     compute_damage_variants(
@@ -757,6 +786,8 @@ fn compute_mean_damage(
       field~,
       protean_consumed~,
       def_disguise_intact~,
+      atk_flash_fire~,
+      def_flash_fire~,
     ),
   )
 }
@@ -787,6 +818,8 @@ fn compute_damage_variants(
   field? : @model.Field = @model.Field::None,
   protean_consumed? : Bool = false,
   def_disguise_intact? : Bool = false,
+  atk_flash_fire? : Bool = false,
+  def_flash_fire? : Bool = false,
 ) -> Array[@model.DamageOutcome] {
   // Status moves and zero-power moves never deal damage. Mirror the early
   // return in `mean_damage_cached` so the variants pipeline does not invent
@@ -815,6 +848,7 @@ fn compute_damage_variants(
           def_ranks_full~,
           weather~,
           field~,
+          step1_flash_fire=def_flash_fire,
         )
         // ばけのかわ intact な defender へ反射ダメージが返るケースも初撃扱いで
         // ブロックされ chip のみになる。reflect は outcomes_from_calc_result を
@@ -844,9 +878,12 @@ fn compute_damage_variants(
       None => ()
     }
   }
+  // 未発動のもらいびの炎技は能力名を外してから engine に渡す。発動中は
+  // `apply_atk_ability_power` の威力 3/2 (BTR_STATE の 1.5 倍) をそのまま使う。
+  let atk_for_calc = attacker_for_flash_fire(attacker, mv, weather, atk_flash_fire)
   let r = @damage.calc_damage(
     build_input_with_ranks(
-      attacker,
+      atk_for_calc,
       defender,
       mv,
       atk_rank,
@@ -898,6 +935,7 @@ fn reflect_damage_outcomes(
   def_ranks_full? : Array[Int]? = None,
   weather? : @model.Weather = @model.Weather::None,
   field? : @model.Field = @model.Field::None,
+  step1_flash_fire? : Bool = false,
 ) -> Array[@model.DamageOutcome] {
   let _ = atk_burn
   // Type immunity check: reflect move's own type vs the OPPONENT (defender,
@@ -970,6 +1008,7 @@ fn reflect_damage_outcomes(
       allow_reflect=false,
       weather~,
       field~,
+      atk_flash_fire=step1_flash_fire,
     )
     let step1_mean = avg_mean_damage(step1_outcomes)
     let p_slow_i = compute_p_slow(kind, mv_i, attacker, defender)
@@ -1107,6 +1146,34 @@ fn apply_damage_variants_fanout(
   let target_is_me = !attacker_is_me
   let target_slot = defender_active
   let attacker_slot = attacker_active
+  // 吸収: 防御側が技を吸収すると、技は当たらず (ダメージ / 状態異常 / 自己効果 /
+  // 接触 proc なし) ランク上昇か 1/4 回復だけが起きる。命中判定より前なので、outcomes
+  // の分布によらず単一 leaf (確率 1.0) を返す。`attempt_turn_with_cache` が同じ
+  // 判定で命中率を 100 に固定するため、ここでは外れ枝が来ない。
+  if move_absorbed_by_holder(
+    state,
+    attacker_is_me,
+    attacker_slot,
+    target_slot,
+    attacker_team,
+    defender_team,
+    attacker_move,
+  ) {
+    return [
+      (
+        1.0,
+        with_absorb_effects(
+          state,
+          attacker_is_me,
+          attacker_slot,
+          target_slot,
+          attacker_team,
+          defender_team,
+          attacker_move,
+        ),
+      ),
+    ]
+  }
   // ばけのかわ: 被弾側 slot が intact なら (a) 初段被弾を無効化して chip で剥がす、
   // (b) reflect / 通常技いずれも outcome.mean_damage は既に「初段減算 + chip」
   // 済みで届く (compute_damage_variants / outcomes_from_calc_result の transform)。
@@ -1114,8 +1181,23 @@ fn apply_damage_variants_fanout(
   // drain を計算し、初撃なら剥がれフラグを立てる。`state` は攻撃解決前の状態なので
   // intact 判定に使える。chip は engine の def_hp_override と整合する
   // effective_hp/8 (= transform 側 r.defender_hp/8 と同値)。
+  let atk_megaed_arr = if attacker_is_me {
+    state.my_megaed
+  } else {
+    state.opp_megaed
+  }
+  let atk_is_mega = attacker_slot < atk_megaed_arr.length() &&
+    atk_megaed_arr[attacker_slot]
+  let atk_break_ability = effective_combatant(
+    attacker_team[attacker_slot],
+    atk_is_mega,
+  ).ability
   let def_disguise_intact = disguise_intact_of(
-    state, attacker_is_me, defender_team, target_slot,
+    state,
+    attacker_is_me,
+    defender_team,
+    target_slot,
+    attacker_ability=atk_break_ability,
   )
   let disguise_chip = if def_disguise_intact &&
     target_slot >= 0 &&
@@ -1127,6 +1209,33 @@ fn apply_damage_variants_fanout(
   let leaves : Array[(Double, SwitchingGameState)] = []
   for i = 0; i < outcomes.length(); i = i + 1 {
     let outcome = outcomes[i]
+    // タイプ / 特性で無効 (`compute_damage_variants` の hits_count=0 sentinel) な leg は
+    // 技が当たらない。自己ダウン / 反動 / 回復 / 自己 recharge / 相手ダウン / 状態異常 /
+    // 接触 proc は起きず、自爆 (self_ko) と Protean 記録だけが残る (`with_immune_effects`)。
+    if outcome.hits_count == 0 {
+      // 崩れ技の免疫 leg は使用者が崩れ HP を失う (Showdown `MoveFail`)。外れ枝は
+      // attempt 段 (`miss_self_loss_outcomes`) で処理する。`with_crash_damage` と
+      // `with_max_hp_recoil` は互いの技では恒等 (崩れ技 と てっていこうせん は別集合)。
+      let immune_state = with_immune_effects(
+        state, attacker_is_me, attacker_slot, attacker_team, attacker_move,
+      )
+      leaves.push((
+        outcome.probability,
+        // 免疫 (MoveFail) の使用者 HP 消費: 崩れ技は対象の生死によらず消費する (main)、
+        // てっていこうせん は対象生存時のみ (反動)。どちらも非該当の技では恒等。
+        with_max_hp_recoil(
+          with_crash_damage(
+            immune_state, attacker_is_me, attacker_slot, attacker_team, attacker_move,
+          ),
+          attacker_is_me,
+          attacker_slot,
+          attacker_team,
+          attacker_move,
+          pre_dmg_defender_hp > 0,
+        ),
+      ))
+      continue
+    }
     // ドレイン / 反動 が overkill 分を吸わないように、実 dealt = min(theoretical,
     // pre_dmg_defender_hp) でクランプ。本家挙動 (Showdown / Gen9) は「与えた
     // ダメージ」基準で吸収・反動を計算するため、防御側 HP が技の理論値を
@@ -1155,6 +1264,17 @@ fn apply_damage_variants_fanout(
     } else {
       actual_dmg
     }
+    // 二次状態異常 (追加効果) の写し: この命中で相手の HP が減ったときだけ付く。ばけのかわ の
+    // 吸収 chip は HP を減らすので付く (Showdown fallback)。ちからずく の使用者は追加効果を失う。
+    // `secondary_gated_move` が SSoT。
+    let secondary_move = secondary_gated_move(
+      state,
+      attacker_is_me,
+      attacker_slot,
+      attacker_team,
+      attacker_move,
+      actual_dmg,
+    )
     // HP 減算は chip 込みの full damage (outcome.mean_damage) で行う。
     let state_dmg0 = with_hp_damage(
       state,
@@ -1178,11 +1298,37 @@ fn apply_damage_variants_fanout(
     // self_ko / recharge / stat_effects compound on the variant-specific
     // damage rather than a single mean. State remains immutable; with_-
     // post_hit_effects produces a fresh copy with updated arrays.
-    let state_v = with_post_hit_effects(
+    let state_v0 = with_post_hit_effects(
       state_dmg, attacker_is_me, attacker_slot, target_slot, attacker_team, defender_team,
       attacker_move, dmg_for_effects,
     )
-    let sub = compose_fanouts(state_v, [
+    // てっていこうせん の最大 HP 反動: 命中は実ダメージ (dmg_for_effects) > 0 のときだけ
+    // 発動する (Showdown `totalDamage` が真のときのみ `applyRecoilDamage`)。
+    let state_v = with_max_hp_recoil(
+      state_v0,
+      attacker_is_me,
+      attacker_slot,
+      attacker_team,
+      attacker_move,
+      dmg_for_effects > 0,
+    )
+    // こおり: 与ダメージのある炎タイプの攻撃技は凍った相手を解凍する (本文 help_syn.json:26184
+    // "if it takes damage from a Fire-type move"; Showdown `frz.onDamagingHit`)。状態異常の
+    // 二次効果より前に解凍するので、解凍された相手には同じ技の二次効果が付与できる。
+    // 変化技 (ひのこ系の状態技) とダメージ 0 (ばけのかわ / 無効) では解凍しない。
+    let state_thawed = if dmg_for_effects > 0 &&
+      attacker_move.category != @model.Status &&
+      @damage.resolve_effective_move_type(
+          attacker_move,
+          state.weather,
+          attacker_team[attacker_slot].ability,
+        ) ==
+        "ほのお" {
+      with_thaw(state_v, target_is_me, target_slot)
+    } else {
+      state_v
+    }
+    let sub = compose_fanouts(state_thawed, [
       fn(s) {
         apply_item_pre_damage_proc_fanout(
           s,
@@ -1213,9 +1359,32 @@ fn apply_damage_variants_fanout(
           target_is_me,
           target_slot,
           defender_team,
-          attacker_move,
+          secondary_move,
           hits_count=outcome.hits_count,
+          attacker_ability=atk_break_ability,
         )
+      },
+      // ひるみ (追加効果): 相手が生存し、特性で遮断されないときに命中数ぶんの独立抽選で成立し、
+      // 成立枝には相手側の `*_flinched` が立つ。後攻の行動はその後 `resolve_pending_attempt` が止める。
+      fn(s) {
+        maybe_apply_flinch_fanout(
+          s,
+          target_is_me,
+          target_slot,
+          defender_team,
+          secondary_move,
+          hits_count=outcome.hits_count,
+          attacker_ability=atk_break_ability,
+        )
+      },
+      // こおり: 解凍技 (Scald / Scorching Sands 等) は命中後に相手を解凍する。Showdown
+      // `onAfterMoveSecondary` と同順なので、凍っている間は二次効果の状態異常は付かない。
+      fn(s) {
+        if dmg_for_effects > 0 && @damage.is_thaws_target_move(attacker_move.name) {
+          [(1.0, with_thaw(s, target_is_me, target_slot))]
+        } else {
+          [(1.0, s)]
+        }
       },
       fn(s) {
         apply_contact_proc_fanout(
@@ -1307,7 +1476,7 @@ fn with_post_hit_effects(
   let my_must_recharge = state.my_must_recharge.copy()
   let opp_must_recharge = state.opp_must_recharge.copy()
   // Stage 7 (Rest): attacker_status は apply_healing で書き換わる可能性が
-  // あるので copy on write。Rest が attacker_status[active] を Sleep(2) で
+  // あるので copy on write。Rest が attacker_status[active] を RestSleep(2) で
   // 上書きする本家挙動を反映する。non-Rest pathways では unchanged のまま
   // 最終 state にスレッドされる。
   let my_status = state.my_status.copy()
@@ -1321,6 +1490,9 @@ fn with_post_hit_effects(
   let opp_leech_seeded = state.opp_leech_seeded.copy()
   let my_protean_locked = state.my_protean_locked.copy()
   let opp_protean_locked = state.opp_protean_locked.copy()
+  // しろいハーブ (held_item_stat_reset.mbt) の消費フラグ。技の効果の後に両 active を判定する。
+  let my_item_consumed = state.my_item_consumed.copy()
+  let opp_item_consumed = state.opp_item_consumed.copy()
   // Stage 11 (Wish): attacker 側の wish_turns scalar を書き換える可能性があるため
   // ローカルに展開。Wish 以外の経路では unchanged のまま base state を経由して
   // 最終 state にスレッドされる。Wish の発動は attacker_is_me に応じて
@@ -1346,13 +1518,58 @@ fn with_post_hit_effects(
   // mega 後実効と常に一致し、drain 経路の defender_ability raw 慣例とも整合する。
   let attacker_ability = attacker_team[attacker_active].ability
   let defender_ability = defender_team[defender_active].ability
+  // 相手ダウン (stat_effects) の防御特性は mega 後の実効特性で判定する。Mega Metagross は
+  // クリアボディ を失い かたいツメ になる (Mega Pinsir は かいりきバサミ を失う)。mega で
+  // なければ raw と同値なので、従来経路と結果は変わらない。フラワーベールのくさ判定も
+  // 同じ実効個体の type1 / type2 を見る (メガでくさを失えばブロックしない)。
+  let defender_megaed = if attacker_is_me {
+    state.opp_megaed
+  } else {
+    state.my_megaed
+  }
+  let defender_is_mega = defender_active < defender_megaed.length() &&
+    defender_megaed[defender_active]
+  let defender_for_drop = defender_team[defender_active]
+  let (defender_stat_ability, defender_type1, defender_type2) = if defender_is_mega {
+    let eff = effective_combatant(defender_for_drop, true)
+    (eff.ability, eff.pokemon.type1, eff.pokemon.type2)
+  } else {
+    (
+      defender_ability,
+      defender_for_drop.pokemon.type1,
+      defender_for_drop.pokemon.type2,
+    )
+  }
+  // かたやぶりのときだけ、技の解決で見る受け手特性を外す。それ以外は同じ文字列。
+  let attacker_megaed_break = if attacker_is_me {
+    state.my_megaed
+  } else {
+    state.opp_megaed
+  }
+  let atk_mega_break = attacker_active < attacker_megaed_break.length() &&
+    attacker_megaed_break[attacker_active]
+  let atk_break_ability = if atk_mega_break {
+    effective_combatant(attacker_team[attacker_active], true).ability
+  } else {
+    attacker_ability
+  }
+  let defender_stat_seen = defender_ability_for_move(
+    atk_break_ability,
+    defender_stat_ability,
+  )
+  let defender_drain_seen = defender_ability_for_move(
+    atk_break_ability,
+    defender_ability,
+  )
   apply_stat_effects(
     attacker_ranks,
     defender_ranks,
     opp_alive,
     mv,
     attacker_ability~,
-    defender_ability~,
+    defender_ability=defender_stat_seen,
+    defender_type1~,
+    defender_type2~,
   )
   apply_recoil(attacker_hps, attacker_active, mv, dmg)
   // 回復技 (HealingEffect) は self_ko の **手前** で適用する。本家挙動と
@@ -1364,7 +1581,7 @@ fn with_post_hit_effects(
   // 選択できるようにする。FixedFraction では参照されない。
   // Stage 7: attacker_status と attacker_ability を追加で渡す。Rest が
   // ability_blocks_status(SleepKind) を見て免疫 ability の場合は失敗し、
-  // それ以外では attacker_status[active] を Sleep(2) に上書きする。
+  // それ以外では attacker_status[active] を RestSleep(2) に上書きする。
   // Stage 8: dmg と defender_ability を追加で渡す。Drain (ギガドレイン等) が
   // dmg * n / d を吸収し、defender_ability=ヘドロえき なら反転して attacker
   // が damage を受ける。defender_ability は damage 計算で参照される mega 後の
@@ -1398,11 +1615,13 @@ fn with_post_hit_effects(
     attacker_max,
     state.weather,
     attacker_status,
-    attacker_ability,
+    atk_eff.ability,
     dmg,
-    defender_ability,
+    defender_drain_seen,
     field=state.field,
     attacker_grounded~,
+    attacker_type1=atk_eff.pokemon.type1,
+    attacker_type2=atk_eff.pokemon.type2,
   )
   // Stage 9 (LeechSeed planting): `apply_healing` は attacker 側のバッファ
   // (HP / status) しか書き換えられない設計だが、LeechSeed は defender 側の
@@ -1493,8 +1712,9 @@ fn with_post_hit_effects(
   //   - カテゴリゲートなし: Status 技でも発動する
   // ダメージ計算は本フックより前に走るため、発動技自身のダメージは pre-lock
   // 状態で計算済み。ここで記録するロックは「次手以降」の damage / type-chart に
-  // 効く。記録値は `mv.type_` で variant 非依存なので、`apply_damage_variants-
-  // _fanout` から variant ごとに呼ばれても全 leaf が同一値に収束する。
+  // 効く。記録値は解決後の技タイプ (`protean_lock_type`) で variant 非依存なので、
+  // `apply_damage_variants_fanout` から variant ごとに呼ばれても全 leaf が同一値に
+  // 収束する。命中外れは `with_miss_self_loss` / `partial_act_with_miss_protean`。
   //
   // Stage 5: 発動判定は base ability ではなく **mega 後の実効特性** (`atk_eff`)
   // を見る。base げきりゅう → mega へんげんじざい のように mega で初めて Protean
@@ -1509,15 +1729,9 @@ fn with_post_hit_effects(
     opp_protean_locked
   }
   if attacker_active < attacker_team.length() {
-    if (
-        atk_eff.ability == "へんげんじざい" ||
-        atk_eff.ability == "リベロ"
-      ) &&
-      atk_eff.tera_type == "" &&
-      attacker_active < attacker_protean.length() &&
-      attacker_protean[attacker_active] == "" {
-      attacker_protean[attacker_active] = mv.type_
-    }
+    record_protean_on_use(
+      atk_eff, attacker_protean, attacker_active, mv, state.weather,
+    )
   }
   if mv.self_ko {
     attacker_hps[attacker_active] = 0
@@ -1525,6 +1739,33 @@ fn with_post_hit_effects(
   if mv.recharge && attacker_hps[attacker_active] > 0 {
     attacker_must_recharge[attacker_active] = true
   }
+  // しろいハーブ: 技の効果 (相手ダウン / 自己ダウン / まけんき・かちき の反応) の後に
+  // 両 active を判定する。自己ダウンで負になった技の使用者も、ここで解除される。
+  // self_ko 後に判定するので、技で ひんし になった所持者は消費されない。
+  let attacker_item_consumed = if attacker_is_me {
+    my_item_consumed
+  } else {
+    opp_item_consumed
+  }
+  let defender_item_consumed = if attacker_is_me {
+    opp_item_consumed
+  } else {
+    my_item_consumed
+  }
+  apply_held_item_stat_reset(
+    attacker_team,
+    attacker_active,
+    attacker_hps,
+    attacker_ranks,
+    attacker_item_consumed,
+  )
+  apply_held_item_stat_reset(
+    defender_team,
+    defender_active,
+    defender_hps,
+    defender_ranks,
+    defender_item_consumed,
+  )
   // Stage 5 (healing-moves plan): 天候設定技 (にほんばれ / あまごい /
   // すなあらし / ゆきげしき) の効果を state に反映する。`mv.weather_set` が
   // `Some(w)` なら weather と weather_turns_left を上書き、`None` なら維持。
@@ -1556,6 +1797,8 @@ fn with_post_hit_effects(
     opp_hps,
     my_ranks,
     opp_ranks,
+    my_item_consumed,
+    opp_item_consumed,
     my_must_recharge,
     opp_must_recharge,
     my_status,
@@ -1571,6 +1814,571 @@ fn with_post_hit_effects(
     field: new_field,
     field_turns_left: new_field_turns,
   }
+}
+
+///|
+/// Type Protean / Libero would lock to, or `""` when the ability does not
+/// change the user.
+///
+/// Champions `TOKUSEIINFO_SYN_168` / `_236`: "Changes the Pokémon’s type to
+/// the type of the move it’s about to use. This works only once per time the
+/// Pokémon enters battle." The type is the move's resolved type (Weather Ball
+/// via `resolve_effective_move_type`, then skin). A user that is already
+/// exactly that single type does not change, so the once-per-entry is not
+/// consumed (Showdown `getTypes().join() !== type` inside `onPrepareHit`).
+fn protean_lock_type(
+  atk_eff : Combatant,
+  mv : @model.Move,
+  weather : @model.Weather,
+) -> String {
+  if atk_eff.tera_type != "" {
+    return ""
+  }
+  if atk_eff.ability != "へんげんじざい" && atk_eff.ability != "リベロ" {
+    return ""
+  }
+  let t = @damage.resolve_effective_move_type(mv, weather, atk_eff.ability)
+  if t == "" {
+    return ""
+  }
+  let type2 = atk_eff.pokemon.type2
+  let already_single = atk_eff.pokemon.type1 == t && (type2 == "" || type2 == t)
+  if already_single {
+    ""
+  } else {
+    t
+  }
+}
+
+///|
+/// Protean / Libero: the user's type becomes the resolved type of the move it
+/// is about to use, once per switch-in (`locked[active]` keeps the first
+/// type). `atk_eff` is the effective combatant (mega-resolved); a
+/// Terastallized user keeps its type. Shared by the hit, absorb, immune, and
+/// accuracy-miss paths: Showdown runs `PrepareHit` before `TryHit` and
+/// Accuracy, so a miss still sets the lock.
+fn record_protean_on_use(
+  atk_eff : Combatant,
+  locked : Array[String],
+  attacker_active : Int,
+  mv : @model.Move,
+  weather : @model.Weather,
+) -> Unit {
+  if attacker_active < 0 ||
+    attacker_active >= locked.length() ||
+    locked[attacker_active] != "" {
+    return
+  }
+  let t = protean_lock_type(atk_eff, mv, weather)
+  if t != "" {
+    locked[attacker_active] = t
+  }
+}
+
+///|
+/// Whether an accuracy miss would write a new Protean / Libero lock.
+///
+/// False when the slot is already locked, Terastallized, not Protean / Libero,
+/// or already exactly the move's resolved type. Callers must then keep the
+/// pre-change transition: one `partial_act_outcomes`, with no speed-order
+/// split. Splitting two identical orders changes a cell by 1 ULP and moves
+/// the selection simplex off the previous vertex.
+fn protean_miss_would_lock(
+  state : SwitchingGameState,
+  user_is_me : Bool,
+  user_slot : Int,
+  user_team : Array[Combatant],
+  mv : @model.Move,
+) -> Bool {
+  if user_slot < 0 || user_slot >= user_team.length() {
+    return false
+  }
+  let locked = if user_is_me {
+    state.my_protean_locked
+  } else {
+    state.opp_protean_locked
+  }
+  if user_slot >= locked.length() || locked[user_slot] != "" {
+    return false
+  }
+  let megaed = if user_is_me { state.my_megaed } else { state.opp_megaed }
+  let is_mega = user_slot < megaed.length() && megaed[user_slot]
+  protean_lock_type(
+    effective_combatant(user_team[user_slot], is_mega),
+    mv,
+    state.weather,
+  ) != ""
+}
+
+///|
+/// Record Protean / Libero on `state` for a move the user is about to use
+/// (including an accuracy miss). Mega-resolved ability and types. Returns
+/// `state` unchanged when the ability does not fire.
+fn with_protean_on_use_state(
+  state : SwitchingGameState,
+  user_is_me : Bool,
+  user_slot : Int,
+  user_team : Array[Combatant],
+  mv : @model.Move,
+) -> SwitchingGameState {
+  if user_slot < 0 || user_slot >= user_team.length() {
+    return state
+  }
+  let my_protean_locked = state.my_protean_locked.copy()
+  let opp_protean_locked = state.opp_protean_locked.copy()
+  let locked = if user_is_me {
+    my_protean_locked
+  } else {
+    opp_protean_locked
+  }
+  let megaed = if user_is_me { state.my_megaed } else { state.opp_megaed }
+  let is_mega = user_slot < megaed.length() && megaed[user_slot]
+  record_protean_on_use(
+    effective_combatant(user_team[user_slot], is_mega),
+    locked,
+    user_slot,
+    mv,
+    state.weather,
+  )
+  { ..state, my_protean_locked, opp_protean_locked }
+}
+
+///|
+/// The ability that acts for the holder at `slot`: the mega-resolved ability
+/// when that slot has mega-evolved, otherwise the raw ability (the convention
+/// `with_post_hit_effects` uses for the defender).
+fn holder_ability_of(
+  state : SwitchingGameState,
+  holder_is_me : Bool,
+  slot : Int,
+  holder_team : Array[Combatant],
+) -> String {
+  let megaed = if holder_is_me { state.my_megaed } else { state.opp_megaed }
+  if slot < megaed.length() && megaed[slot] {
+    effective_combatant(holder_team[slot], true).ability
+  } else {
+    holder_team[slot].ability
+  }
+}
+
+///|
+/// Mega for this hit: already mega-evolved, or the side megas at the start of
+/// this turn. `attempt_accuracy` runs before `turn_start_mega` writes the flag,
+/// so the this-turn trigger has to be passed in. Fanout runs after the flag is
+/// set and can leave the trigger false.
+fn slot_mega_for_hit(
+  megaed : Array[Bool],
+  slot : Int,
+  mega_trigger : Bool,
+) -> Bool {
+  mega_trigger || (slot >= 0 && slot < megaed.length() && megaed[slot])
+}
+
+///|
+/// Protean lock seen by this hit. `resolve_moves` clears the lock whenever the
+/// slot is on mega stats this turn (`*_mega_now`, already megaed or triggered),
+/// before damage. The accuracy check uses the same view.
+fn protean_for_hit(
+  locked : Array[String],
+  slot : Int,
+  is_mega : Bool,
+) -> String {
+  if is_mega {
+    ""
+  } else if slot >= 0 && slot < locked.length() {
+    locked[slot]
+  } else {
+    ""
+  }
+}
+
+///|
+/// Attacker and defender as the hit resolves them: post-mega ability and types,
+/// then the Protean override (cleared when that side is mega this turn).
+fn effective_hit_pair(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  defender_slot : Int,
+  attacker_team : Array[Combatant],
+  defender_team : Array[Combatant],
+  attacker_mega_trigger : Bool,
+  defender_mega_trigger : Bool,
+) -> (Combatant, Combatant)? {
+  if attacker_slot < 0 ||
+    attacker_slot >= attacker_team.length() ||
+    defender_slot < 0 ||
+    defender_slot >= defender_team.length() {
+    return None
+  }
+  let atk_megaed = if attacker_is_me {
+    state.my_megaed
+  } else {
+    state.opp_megaed
+  }
+  let def_megaed = if attacker_is_me {
+    state.opp_megaed
+  } else {
+    state.my_megaed
+  }
+  let atk_locked = if attacker_is_me {
+    state.my_protean_locked
+  } else {
+    state.opp_protean_locked
+  }
+  let def_locked = if attacker_is_me {
+    state.opp_protean_locked
+  } else {
+    state.my_protean_locked
+  }
+  let atk_mega = slot_mega_for_hit(
+    atk_megaed, attacker_slot, attacker_mega_trigger,
+  )
+  let def_mega = slot_mega_for_hit(
+    def_megaed, defender_slot, defender_mega_trigger,
+  )
+  let atk = effective_combatant(
+    attacker_team[attacker_slot],
+    atk_mega,
+    protean_locked=protean_for_hit(atk_locked, attacker_slot, atk_mega),
+  )
+  let def0 = effective_combatant(
+    defender_team[defender_slot],
+    def_mega,
+    protean_locked=protean_for_hit(def_locked, defender_slot, def_mega),
+  )
+  Some((atk, defender_for_mold_breaker(atk, def0)))
+}
+
+///|
+/// Absorb check: does the defender at `defender_slot` absorb `mv` from the
+/// attacker at `attacker_slot`? Both sides are
+/// `effective_hit_pair` (post-mega ability and types, Protean override). The
+/// move type is the same pre-immunity chain the engine uses
+/// (`resolve_effective_move_type`). Covers damaging and status moves alike,
+/// since Showdown's `onTryHit` runs for both.
+fn move_absorbed_by_holder(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  defender_slot : Int,
+  attacker_team : Array[Combatant],
+  defender_team : Array[Combatant],
+  mv : @model.Move,
+  attacker_mega_trigger? : Bool = false,
+  defender_mega_trigger? : Bool = false,
+) -> Bool {
+  match effective_hit_pair(
+    state,
+    attacker_is_me,
+    attacker_slot,
+    defender_slot,
+    attacker_team,
+    defender_team,
+    attacker_mega_trigger,
+    defender_mega_trigger,
+  ) {
+    None => false
+    Some((atk_eff, def_eff)) => {
+      let move_type = @damage.resolve_effective_move_type(
+        mv,
+        state.weather,
+        atk_eff.ability,
+      )
+      ability_absorbs_move(def_eff.ability, mv.name, move_type)
+    }
+  }
+}
+
+///|
+/// 変化技が、実効の受け手に効かない。命中しても外れても結果が同じなので
+/// 命中分岐を作らない。`atk` と `def` はメガと Protean を解決済み。
+///
+/// 吸収は false。回復と上昇は吸収経路に残す (Showdown の TryHit は
+/// TryImmunity より前)。無効の中身は新しい表を持たず、次をそのまま呼ぶ。
+/// - `prankster_status_blocked` (あく)
+/// - `powder_move_blocked` (粉技のくさタイプ / ぼうじん)
+/// - `immune_to_status` と `ability_blocks_status`
+/// - こおりだけ `ability_blocks_freeze` と はれ
+///   (`secondary_blocked_by_holder` と同じ条件)
+/// - でんじは だけ `move_effectiveness_slots_x4` の 0 倍。じめんは
+///   `immune_to_status` のまひに入らない (にらみつけるは当たる)。
+///   Showdown で変化技の `ignoreImmunity: false` はでんじはだけ。
+///
+/// どくタイプが使うどくどくの必中、フィールド、すでに状態異常の相手、
+/// ぼうじんゴーグルはここでは見ない。
+fn status_move_fails_on_foe(
+  atk : Combatant,
+  mv : @model.Move,
+  def : Combatant,
+  weather : @model.Weather,
+) -> Bool {
+  if mv.category != @model.Status {
+    return false
+  }
+  let move_type = @damage.resolve_effective_move_type(mv, weather, atk.ability)
+  if ability_absorbs_move(def.ability, mv.name, move_type) {
+    return false
+  }
+  if prankster_status_blocked(atk, false, mv, def, false, "") {
+    return true
+  }
+  // 粉は TryHit (吸収) の後。くさタイプとぼうじんだけ。道具は見ない。
+  if powder_move_blocked(
+    mv.name,
+    def.pokemon.type1,
+    def.pokemon.type2,
+    def.ability,
+  ) {
+    return true
+  }
+  if mv.name == "でんじは" {
+    let (e1, e2) = @damage.move_effectiveness_slots_x4(
+      mv.name,
+      move_type,
+      def.pokemon.type1,
+      def.pokemon.type2,
+    )
+    if e1 == 0 || e2 == 0 {
+      return true
+    }
+  }
+  match mv.status_effect {
+    None => false
+    Some((kind, chance)) => {
+      if chance <= 0 {
+        return false
+      }
+      if @model.immune_to_status(kind, def.pokemon.type1, def.pokemon.type2) {
+        return true
+      }
+      if ability_blocks_status(
+        def.ability,
+        kind,
+        weather~,
+        type1=def.pokemon.type1,
+        type2=def.pokemon.type2,
+        self_inflicted=false,
+      ) {
+        return true
+      }
+      kind == @model.FreezeKind &&
+      (weather == @model.Weather::Sun || ability_blocks_freeze(def.ability))
+    }
+  }
+}
+
+///|
+/// Showdown runs TryHit (absorb abilities), TypeImmunity, and TryImmunity
+/// before Accuracy. A move that is absorbed, a damaging move the effective
+/// defender is immune to, or a status move `status_move_fails_on_foe` rejects,
+/// has no miss branch. Other status moves still roll accuracy: the damage
+/// pipeline does not treat `power <= 0` as the immune sentinel, and forcing
+/// accuracy to 100 would make でんじは paralyze じめん.
+fn move_skips_accuracy(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  defender_slot : Int,
+  attacker_team : Array[Combatant],
+  defender_team : Array[Combatant],
+  mv : @model.Move,
+  attacker_mega_trigger : Bool,
+  defender_mega_trigger : Bool,
+) -> Bool {
+  match effective_hit_pair(
+    state,
+    attacker_is_me,
+    attacker_slot,
+    defender_slot,
+    attacker_team,
+    defender_team,
+    attacker_mega_trigger,
+    defender_mega_trigger,
+  ) {
+    None => false
+    Some((atk_eff, def_eff)) => {
+      let move_type = @damage.resolve_effective_move_type(
+        mv,
+        state.weather,
+        atk_eff.ability,
+      )
+      ability_absorbs_move(def_eff.ability, mv.name, move_type) ||
+      damaging_move_immune(
+        def_eff.ability,
+        mv.name,
+        move_type,
+        mv.power,
+        def_eff.pokemon.type1,
+        def_eff.pokemon.type2,
+      ) ||
+      status_move_fails_on_foe(atk_eff, mv, def_eff, state.weather)
+    }
+  }
+}
+
+///|
+/// State transition for an absorbed move (`move_absorbed_by_holder` is true).
+/// The move never reaches the holder, so no damage, status, self or opponent
+/// stat effect, recoil, drain, recharge, self-KO, or contact / item proc happens.
+/// The holder gets `ability_absorb_boost` (capped at +6 by `clamp_rank_for`)
+/// and `absorb_healed_hp` (1/4 max HP, capped). A fainted holder gains neither.
+/// サンダーダイブ still crashes: `onTryHit` returning null is a MoveFail, so
+/// `with_crash_damage` runs after the absorb (identity for every other move).
+/// The attacker's Protean / Libero lock is still recorded.
+fn with_absorb_effects(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  defender_slot : Int,
+  attacker_team : Array[Combatant],
+  defender_team : Array[Combatant],
+  mv : @model.Move,
+) -> SwitchingGameState {
+  let my_ranks = state.my_ranks.copy()
+  let opp_ranks = state.opp_ranks.copy()
+  let my_hps = state.my_hps.copy()
+  let opp_hps = state.opp_hps.copy()
+  let holder_is_me = !attacker_is_me
+  let holder_ability = holder_ability_of(
+    state,
+    holder_is_me,
+    defender_slot,
+    defender_team,
+  )
+  let holder_ranks = if holder_is_me { my_ranks } else { opp_ranks }
+  let holder_hps = if holder_is_me { my_hps } else { opp_hps }
+  // A holder that has already fainted is not a valid target (Showdown fails
+  // the move before `onTryHit`), so it gains no boost and no heal.
+  let holder_alive = defender_slot < holder_hps.length() &&
+    holder_hps[defender_slot] > 0
+  if holder_alive && defender_slot < defender_team.length() {
+    match ability_absorb_boost(holder_ability) {
+      Some((stat, delta)) =>
+        holder_ranks[stat] = clamp_rank_for(holder_ability, holder_ranks[stat] + delta)
+      None => ()
+    }
+    let megaed = if holder_is_me { state.my_megaed } else { state.opp_megaed }
+    let is_mega = defender_slot < megaed.length() && megaed[defender_slot]
+    let max_hp = effective_hp(
+      effective_combatant(defender_team[defender_slot], is_mega),
+    )
+    holder_hps[defender_slot] = absorb_healed_hp(
+      holder_ability,
+      holder_hps[defender_slot],
+      max_hp,
+    )
+  }
+  // もらいび状態は生存中の吸収でのみ付く。瀕死には技が通らない。
+  // こおりはダメージを受けたときだけ解ける (help_syn `help_11_04_01`)。吸収は
+  // ダメージ 0 なので解かず、状態だけ付ける。
+  let my_flash_fire = if holder_alive && holder_ability == "もらいび" && holder_is_me {
+    with_flash_fire_lit(state.my_flash_fire, defender_slot)
+  } else {
+    state.my_flash_fire
+  }
+  let opp_flash_fire = if holder_alive &&
+    holder_ability == "もらいび" &&
+    !holder_is_me {
+    with_flash_fire_lit(state.opp_flash_fire, defender_slot)
+  } else {
+    state.opp_flash_fire
+  }
+  let my_protean_locked = state.my_protean_locked.copy()
+  let opp_protean_locked = state.opp_protean_locked.copy()
+  let attacker_protean = if attacker_is_me {
+    my_protean_locked
+  } else {
+    opp_protean_locked
+  }
+  if attacker_slot < attacker_team.length() {
+    let atk_megaed = if attacker_is_me {
+      state.my_megaed
+    } else {
+      state.opp_megaed
+    }
+    let atk_is_mega = attacker_slot < atk_megaed.length() &&
+      atk_megaed[attacker_slot]
+    record_protean_on_use(
+      effective_combatant(attacker_team[attacker_slot], atk_is_mega),
+      attacker_protean,
+      attacker_slot,
+      mv,
+      state.weather,
+    )
+  }
+  let absorbed = {
+    ..state,
+    my_ranks,
+    opp_ranks,
+    my_hps,
+    opp_hps,
+    my_protean_locked,
+    opp_protean_locked,
+    my_flash_fire,
+    opp_flash_fire,
+  }
+  // onTryHit null still MoveFails, so サンダーダイブ crashes. Other moves are
+  // unchanged (`with_crash_damage` is identity when `is_crash_move` is false).
+  with_crash_damage(
+    absorbed, attacker_is_me, attacker_slot, attacker_team, mv,
+  )
+}
+
+///|
+/// State transition for an immune leg (type or ability immunity; the
+/// `hits_count = 0` sentinel from `compute_damage_variants`). Showdown fails
+/// the move before `spreadMoveHit`: `hitStepTypeImmunity` / `TryHit` remove the
+/// target (battle-actions.ts:705-727), so `runMoveEffects`, `selfDrops` and the
+/// recoil in `hitStepMoveHitLoop` never run. What still happens:
+///
+///   - `selfdestruct: 'always'` (じばく / だいばくはつ = `mv.self_ko`): the user
+///     faints in `useMove` before the target steps (battle-actions.ts:564-566).
+///   - Protean / Libero: `PrepareHit` runs before the steps (:652-654), so the
+///     lock is still recorded.
+///
+/// Not applied: self and opponent stat effects, recoil, healing / drain,
+/// `mustrecharge` (self volatile), self-switch, status, contact and item procs,
+/// and the post-move White Herb check (see payoff_semantics.md). `self_ko` is
+/// the only self-KO flag in `move_meta`, so `ifHit` self-faint moves (e.g.
+/// Memento, Final Gambit) are never reached here.
+fn with_immune_effects(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  attacker_team : Array[Combatant],
+  mv : @model.Move,
+) -> SwitchingGameState {
+  let my_hps = state.my_hps.copy()
+  let opp_hps = state.opp_hps.copy()
+  let my_protean_locked = state.my_protean_locked.copy()
+  let opp_protean_locked = state.opp_protean_locked.copy()
+  let attacker_hps = if attacker_is_me { my_hps } else { opp_hps }
+  let attacker_protean = if attacker_is_me {
+    my_protean_locked
+  } else {
+    opp_protean_locked
+  }
+  if attacker_slot < attacker_team.length() {
+    let atk_megaed = if attacker_is_me {
+      state.my_megaed
+    } else {
+      state.opp_megaed
+    }
+    let atk_is_mega = attacker_slot < atk_megaed.length() &&
+      atk_megaed[attacker_slot]
+    record_protean_on_use(
+      effective_combatant(attacker_team[attacker_slot], atk_is_mega),
+      attacker_protean,
+      attacker_slot,
+      mv,
+      state.weather,
+    )
+  }
+  if mv.self_ko && attacker_slot < attacker_hps.length() {
+    attacker_hps[attacker_slot] = 0
+  }
+  { ..state, my_hps, opp_hps, my_protean_locked, opp_protean_locked }
 }
 
 ///|
@@ -1597,9 +2405,30 @@ fn clamp_zero(x : Int) -> Int {
 /// true, the delta's sign is flipped before clamping. Both arguments are
 /// required (no default) so every call site states which abilities it
 /// resolved — non-Contrary inputs are bit-identical to the pre-Contrary
-/// behaviour.
+/// behaviour. `defender_ability~` also feeds まけんき / かちき: a drop that
+/// lands on such a holder (`target=1`, `delta < 0` after the Contrary flip)
+/// goes through `apply_opp_stat_drop`. Each stat that landed reacts once
+/// (`apply_opp_drop_reaction`), after all of the move's drops are applied:
+/// くすぐる / なみだめ react twice when both stats land, and repeated entries
+/// for one stat react once. Because the reactions run last, a drop is judged
+/// against the rank at the start of the move, as Showdown's `boost()` does (it
+/// caps the whole table first): a stat already at -6 does not drop even if a
+/// reaction lifted it earlier in the same move. Self drops (`target=0`) never
+/// react.
 ///
-/// Delta is added and clamped to `[-2, +2]` via `clamp_rank`.
+/// Delta is added and clamped via `clamp_rank_for` against the holder's
+/// ability: `[-2, +2]` for ordinary holders, `[-6, +6]` for まけんき / かちき.
+///
+/// An opponent-inflicted drop (`target=1`, `delta<0` after the flip) is first
+/// checked against the holder's block (`ability_blocks_opp_stat_drop`:
+/// クリアボディ / しろいけむり / メタルプロテクト on every stat, かいりきバサミ on
+/// Attack only, はとむね on Defense only, フラワーベール on every stat only when
+/// `defender_type1` / `defender_type2` is くさ). A blocked drop changes neither the
+/// rank nor the reaction (`landed` stays false), as Showdown's `onTryBoost`
+/// removes it before `AfterEachBoost` runs. Self drops (`target=0`) are never
+/// blocked. Absorb boosts (そうしょく / ひらいしん) are raises on a different
+/// path and do not set `landed`. `defender_type*` default to `""`; only the
+/// フラワーベール arm reads them, so other abilities stay on the previous branch.
 fn apply_stat_effects(
   self_ranks : Array[Int],
   opp_ranks : Array[Int],
@@ -1607,7 +2436,13 @@ fn apply_stat_effects(
   mv : @model.Move,
   attacker_ability~ : String,
   defender_ability~ : String,
+  defender_type1? : String = "",
+  defender_type2? : String = "",
 ) -> Unit {
+  // 相手ダウンは全エントリを適用してから、実際に下がった能力ごとに反応を 1 回ずつ行う。
+  // 反応は opp_ranks (= 所持者の ranks) にしか書かず、自己ダウン (self_ranks) とは独立。
+  // landed[stat] は相手の能力 stat が実際に下がったことを表す (重複エントリは 1 回)。
+  let landed : Array[Bool] = Array::make(opp_ranks.length(), false)
   for eff in mv.stat_effects {
     let (ranks, holder_ability) = if eff.target == 0 {
       (self_ranks, attacker_ability)
@@ -1622,7 +2457,24 @@ fn apply_stat_effects(
       } else {
         eff.delta
       }
-      ranks[eff.stat] = clamp_rank(ranks[eff.stat] + delta)
+      if eff.target == 1 && delta < 0 {
+        if !ability_blocks_opp_stat_drop(
+          holder_ability,
+          eff.stat,
+          type1=defender_type1,
+          type2=defender_type2,
+        ) &&
+          apply_opp_stat_drop(holder_ability, ranks, eff.stat, delta) {
+          landed[eff.stat] = true
+        }
+      } else {
+        ranks[eff.stat] = clamp_rank_for(holder_ability, ranks[eff.stat] + delta)
+      }
+    }
+  }
+  for stat in 0..<landed.length() {
+    if landed[stat] {
+      apply_opp_drop_reaction(defender_ability, opp_ranks)
     }
   }
 }
@@ -1683,6 +2535,8 @@ pub fn resolve_post_hit_effects(
   dmg : Int,
   attacker_ability~ : String,
   defender_ability~ : String,
+  defender_type1? : String = "",
+  defender_type2? : String = "",
 ) -> Unit {
   let opp_alive = defender_hps[defender_active] > 0
   apply_stat_effects(
@@ -1692,6 +2546,8 @@ pub fn resolve_post_hit_effects(
     mv,
     attacker_ability~,
     defender_ability~,
+    defender_type1~,
+    defender_type2~,
   )
   apply_recoil(attacker_hps, attacker_active, mv, dmg)
   if mv.self_ko {

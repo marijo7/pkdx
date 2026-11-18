@@ -167,13 +167,16 @@ pub fn query_champions_moves(
     "LEFT JOIN pokedex.move_meta mm ON mm.name_ja = m.waza\n" +
     "WHERE l.id = ?\n" +
     "ORDER BY CAST(REPLACE(m.power, '-', '0') AS INTEGER) DESC"
-  collect_champions_moves_rows(
+  match collect_champions_moves_rows(
     db,
     sql,
     [pokemon_id],
     has_heal=heal_cols != "",
     has_field=field_cols != "",
-  )
+  ) {
+    Ok(moves) => Ok(apply_flinch_chance(moves, flinch_chance_map(db, "pokedex")))
+    Err(e) => Err(e)
+  }
 }
 
 ///|
@@ -198,7 +201,10 @@ fn collect_champions_moves_rows(
     let r = rows[i]
     let priority = parse_int_simple(r[7])
     let stat_effects = parse_stat_effects_json(r[8])
-    let status_effect = parse_status_effect(r[9], r[10])
+    let status_effect = normalize_status_effect_chance(
+      @model.category_from_jp(r[2]),
+      parse_status_effect(r[9], r[10]),
+    )
     let recoil_num = parse_int_simple(r[11])
     let recoil_den_raw = parse_int_simple(r[12])
     let recoil_den = if recoil_den_raw <= 0 { 1 } else { recoil_den_raw }
@@ -281,6 +287,7 @@ fn collect_champions_moves_rows(
       healing,
       weather_set,
       field_set,
+      flinch_chance: 0,
     })
   }
   Ok(moves)
@@ -333,7 +340,10 @@ pub fn query_champions_move(
   let r = rows[0]
   let priority = parse_int_simple(r[6])
   let stat_effects = parse_stat_effects_json(r[7])
-  let status_effect = parse_status_effect(r[8], r[9])
+  let status_effect = normalize_status_effect_chance(
+    @model.category_from_jp(r[2]),
+    parse_status_effect(r[8], r[9]),
+  )
   let recoil_num = if r.length() > 10 { parse_int_simple(r[10]) } else { 0 }
   let recoil_den_raw = if r.length() > 11 { parse_int_simple(r[11]) } else { 1 }
   let recoil_den = if recoil_den_raw <= 0 { 1 } else { recoil_den_raw }
@@ -422,6 +432,7 @@ pub fn query_champions_move(
     healing,
     weather_set,
     field_set,
+    flinch_chance: flinch_chance_of(flinch_chance_map(db, "pokedex"), r[0]),
   })
 }
 

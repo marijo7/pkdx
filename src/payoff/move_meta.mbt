@@ -24,9 +24,43 @@ pub fn clamp_rank(r : Int) -> Int {
 }
 
 ///|
+/// Clamp a stat stage to the real game range `[-6, +6]`. Used only for the
+/// rank arrays of まけんき / かちき holders (see `clamp_rank_for`).
+pub fn clamp_stat_stage(r : Int) -> Int {
+  if r > 6 {
+    6
+  } else if r < -6 {
+    -6
+  } else {
+    r
+  }
+}
+
+///|
+/// Clamp a rank write by the holder's ability. Holders of まけんき / かちき
+/// are tracked over the real `[-6, +6]` range, because their reaction fires
+/// only when a drop actually lands: a drop must stop at the real floor for
+/// the "did not land at -6" case to be exact. そうしょく holders use the same
+/// range, so the absorb boost stops at +6 as in Showdown. Every other holder
+/// keeps the reduced `[-2, +2]` range (`clamp_rank`), so existing results are
+/// unchanged.
+pub fn clamp_rank_for(owner_ability : String, raw : Int) -> Int {
+  if ability_tracks_full_stages(owner_ability) {
+    clamp_stat_stage(raw)
+  } else {
+    clamp_rank(raw)
+  }
+}
+
+///|
 /// Compare two combatants' turn order accounting for move priority. Returns
 /// `+1` if `a` acts before `b`, `-1` if after, `0` on a full tie. Priority
 /// dominates; speed is the tie-breaker (matches in-game rules).
+///
+/// `prio_a` / `prio_b` are effective priorities. Callers apply
+/// `effective_priority` (いたずらごころ / はやてのつばさ) before this
+/// comparison. The combatant arguments stay for a later modifier that needs
+/// more than the integer; this function only compares the numbers it is given.
 pub fn turn_order_sign(
   a : Combatant,
   prio_a : Int,
@@ -35,9 +69,6 @@ pub fn turn_order_sign(
   prio_b : Int,
   b_spe : Int,
 ) -> Int {
-  // `a` and `b` are kept in the signature for future extensions (ability-
-  // based priority, e.g. プレッシャー / いたずらごころ). Currently unused
-  // beyond the speed values the caller already resolved.
   let _ = a
   let _ = b
   if prio_a > prio_b {

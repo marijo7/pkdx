@@ -191,13 +191,16 @@ fn query_moves_legacy(
   let binds = [
     waza_ver, waza_ver, gno, waza_ver, waza_ver, waza_ver, waza_ver, gno, waza_ver,
   ]
-  collect_moves_rows(
+  match collect_moves_rows(
     db,
     sql,
     binds,
     has_heal=heal_cols != "",
     has_field=field_cols != "",
-  )
+  ) {
+    Ok(moves) => Ok(apply_flinch_chance(moves, flinch_chance_map(db, "")))
+    Err(e) => Err(e)
+  }
 }
 
 ///|
@@ -257,7 +260,10 @@ fn collect_moves_rows(
       []
     }
     let status_effect = if r.length() > 10 {
-      parse_status_effect(r[9], r[10])
+      normalize_status_effect_chance(
+        @model.category_from_jp(r[2]),
+        parse_status_effect(r[9], r[10]),
+      )
     } else {
       None
     }
@@ -343,6 +349,7 @@ fn collect_moves_rows(
       healing,
       weather_set,
       field_set,
+      flinch_chance: 0,
     })
   }
   Ok(moves)
@@ -495,6 +502,24 @@ fn parse_status_effect(
 }
 
 ///|
+/// 変化技 (pure status) の `status_effect` 確率を 100 に正規化する (DB 経路の共通処理)。
+/// `move_meta.ailment_chance` は pure status 技では命中率と同値 (おにび 85 / 命中 85、でんじは 90 /
+/// 命中 90、ねむりごな 75 / 命中 75 など。`pkdx_patch/004_move_meta_ailment` の data.json と
+/// champions.db の `move.accuracy` が一致する)。命中は `move.accuracy` で既に抽選されるので、
+/// ここで確率も残すと DP / MC で「命中 × 確率」の二重抽選になる。ダメージ技 (Physical / Special)
+/// の二次効果は ailment_chance が追加効果の確率なので変えない。JSON 入力 (`pkdx select`) の
+/// `status_effect` には適用しない (入力契約は従来どおり、payoff_semantics.md 参照)。
+pub fn normalize_status_effect_chance(
+  category : @model.MoveCategory,
+  status_effect : (@model.StatusKind, Int)?,
+) -> (@model.StatusKind, Int)? {
+  match (category, status_effect) {
+    (@model.Status, Some((kind, _))) => Some((kind, 100))
+    _ => status_effect
+  }
+}
+
+///|
 /// Look up a move by name (Japanese) — single move lookup distinct from the
 /// learnset-oriented `query_moves`. Used by damage CLI and any caller that
 /// only needs the move metadata, not a learnset listing.
@@ -555,7 +580,10 @@ pub fn query_move(
     []
   }
   let status_effect = if r.length() > 9 {
-    parse_status_effect(r[8], r[9])
+    normalize_status_effect_chance(
+      @model.category_from_jp(r[2]),
+      parse_status_effect(r[8], r[9]),
+    )
   } else {
     None
   }
@@ -642,5 +670,73 @@ pub fn query_move(
     healing,
     weather_set,
     field_set,
+    flinch_chance: flinch_chance_of(flinch_chance_map(db, ""), r[0]),
   })
+}
+
+///|
+/// m019 が `move_meta` に追加する `flinch_chance` 列の有無 (PRAGMA)。
+/// `move_meta_has_field_columns` と同じ pattern (ATTACH 済みなら qualifier = "pokedex")。
+fn move_meta_has_flinch_column(db : Db, qualifier : String) -> Bool {
+  let prefix = if qualifier == "" { "" } else { qualifier + "." }
+  let sql = "PRAGMA " + prefix + "table_info(move_meta)"
+  let rows = match query(db, sql, []) {
+    Ok(r) => r
+    Err(_) => return false
+  }
+  for row in rows {
+    if row.length() > 1 && row[1] == "flinch_chance" {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// 技名 → ひるみ確率 (%) の表 (`flinch_chance > 0` の行だけ)。m019 未適用 DB では空。
+///
+/// Move の SELECT projection には列を足さず、取得後に技名で載せる。projection を増やすと
+/// row parser が 4 本とも has_heal / has_field の index 計算を触ることになり、ひるみの
+/// 数行のためにそこまで広げる理由が無いため。
+fn flinch_chance_map(db : Db, qualifier : String) -> Map[String, Int] {
+  let map : Map[String, Int] = Map([])
+  if !move_meta_has_flinch_column(db, qualifier) {
+    return map
+  }
+  let prefix = if qualifier == "" { "" } else { qualifier + "." }
+  let sql = "SELECT name_ja, flinch_chance FROM " + prefix +
+    "move_meta WHERE flinch_chance > 0"
+  match query(db, sql, []) {
+    Ok(rows) =>
+      for row in rows {
+        if row.length() > 1 {
+          map[row[0]] = parse_int(row[1])
+        }
+      }
+    Err(_) => ()
+  }
+  map
+}
+
+///|
+/// 結果の Move 群に ひるみ確率を載せる (技名一致)。表に無い技は 0 のまま。
+fn apply_flinch_chance(
+  moves : Array[@model.Move],
+  map : Map[String, Int],
+) -> Array[@model.Move] {
+  moves.map(fn(m) {
+    match map.get(m.name) {
+      Some(c) => { ..m, flinch_chance: c }
+      None => m
+    }
+  })
+}
+
+///|
+/// 単一技の ひるみ確率。表に無ければ 0。
+fn flinch_chance_of(map : Map[String, Int], name : String) -> Int {
+  match map.get(name) {
+    Some(c) => c
+    None => 0
+  }
 }

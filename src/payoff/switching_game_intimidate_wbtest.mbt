@@ -81,6 +81,10 @@ fn im_state(
     my_disguise_busted: [false, false, false],
     opp_item_consumed: [false, false, false],
     opp_disguise_busted: [false, false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -93,6 +97,8 @@ fn im_state(
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -251,6 +257,7 @@ test "いかく: partial_act_outcomes (true,Switch) で opp active の A -1" {
     my_team,
     opp_team,
     new_damage_cache(),
+    UseMove(0),
   )
   @debug.assert_eq(outs.length(), 1)
   let (_, s) = outs[0]
@@ -276,6 +283,7 @@ test "いかく: partial_act_outcomes (false,Switch) で my active の A -1" {
     my_team,
     opp_team,
     new_damage_cache(),
+    UseMove(0),
   )
   @debug.assert_eq(outs.length(), 1)
   let (_, s) = outs[0]
@@ -470,4 +478,48 @@ test "いかく: value-level — 物理アタッカー相手の value がいか�
   let v_intim = switching_game_winrate([attacker], [intim_def], 4)
   let v_plain = switching_game_winrate([attacker], [plain_def], 4)
   assert_true(v_intim < v_plain)
+}
+
+///|
+/// 交代先のフラワーベールは、実効タイプがくさのときだけいかくを受けない。
+/// フェアリー (Champions の所持種) は A -1。
+test "いかく: 交代先のフラワーベールはくさのときだけ A が下がらない" {
+  let mv = im_tackle()
+  let intimidator = im_combatant(
+    im_pokemon("いかく持ち"),
+    [mv],
+    ability="いかく",
+  )
+  let plain = im_combatant(im_pokemon("ふつう"), [mv])
+  let grass = im_combatant(
+    { ..im_pokemon("くさベール"), type1: "くさ" },
+    [mv],
+    ability="フラワーベール",
+  )
+  let fairy = im_combatant(
+    { ..im_pokemon("フェアリーベール"), type1: "フェアリー" },
+    [mv],
+    ability="フラワーベール",
+  )
+  let my_team = [plain, intimidator, plain]
+  let outs_grass = transition_with_cache(
+    im_state(),
+    ActionKind::Switch(1),
+    ActionKind::Switch(1),
+    my_team,
+    [plain, grass, plain],
+    new_damage_cache(),
+  )
+  @debug.assert_eq(outs_grass[0].1.my_ranks[0], 0)
+  @debug.assert_eq(outs_grass[0].1.opp_ranks[0], 0)
+  let outs_fairy = transition_with_cache(
+    im_state(),
+    ActionKind::Switch(1),
+    ActionKind::Switch(1),
+    my_team,
+    [plain, fairy, plain],
+    new_damage_cache(),
+  )
+  @debug.assert_eq(outs_fairy[0].1.my_ranks[0], 0)
+  @debug.assert_eq(outs_fairy[0].1.opp_ranks[0], -1)
 }
