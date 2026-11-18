@@ -61,6 +61,10 @@ fn h1_state_from_weather_field(
     my_disguise_busted: Array::make(my_team.length(), false),
     opp_item_consumed: Array::make(opp_team.length(), false),
     opp_disguise_busted: Array::make(opp_team.length(), false),
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: Array::make(my_team.length(), 0),
     opp_moves_used: Array::make(opp_team.length(), 0),
     weather: w,
@@ -73,6 +77,8 @@ fn h1_state_from_weather_field(
     opp_wish_turns: no_wish_pending(opp_team.length()),
     field: f,
     field_turns_left: 999,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }

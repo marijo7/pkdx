@@ -6,8 +6,8 @@
 /// on multi-hit moves.
 
 ///|
-test "SCHEMA_VERSION is 6 (bumped for protean lock type in cache key)" {
-  @debug.debug_inspect(@damage_cache.SCHEMA_VERSION, content="6")
+test "SCHEMA_VERSION is 8 (bumped so a no-secondary ちからずく hit cannot reuse a boosted entry)" {
+  @debug.debug_inspect(@damage_cache.SCHEMA_VERSION, content="8")
 }
 
 ///|

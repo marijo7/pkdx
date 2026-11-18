@@ -8,7 +8,9 @@
 ///   "opponent": [<combatant>, ...],
 ///   "format":   "single" | "double",
 ///   "stat_system": "champions" | "standard",  // default: "champions"
-///   "team_payoff_model": "switching_game" | "screened_switching_game:..."
+///   "team_payoff_model": "switching_game" | "screened_switching_game:...",
+///   "my_fresh": true | false,    // optional. 省略 = 未追跡 (ねこだまし / であいがしら は従来どおり)
+///   "opp_fresh": true | false    // optional. バトル開始のリードで撃つときは true
 /// }
 ///
 /// <combatant> = {
@@ -22,7 +24,26 @@
 ///                 "name_ja":String}?,  // optional; present if mega-capable
 ///   "ivs": {"h":Int, "a":Int, "b":Int, "c":Int, "d":Int, "s":Int}?,
 ///   "moves":   [{"name":..., "type":..., "category":"物理"|"特殊"|"変化",
-///                "power":Int, "priority":Int?, "stat_effects":[[Int,Int], ...]?}, ...]
+///                "power":Int, "priority":Int?, "stat_effects":[[Int,Int], ...]?,
+///                "status_effect":{"kind":String, "chance":Int}?,
+///                "flinch_chance":Int?,
+///                "recoil_num":Int?, "recoil_den":Int?, "self_ko":Bool?,
+///                "recharge":Bool?, "heal_kind":String?, "heal_num":Int?,
+///                "heal_den":Int?, "heal_sunny_num":Int?, "heal_sunny_den":Int?,
+///                "heal_harsh_num":Int?, "heal_harsh_den":Int?,
+///                "weather_set":String?, "field_set":String?}, ...]
+///   // status_effect: kind は まひ/やけど/どく/もうどく/ねむり/こおり/あくび (和名)、
+///   //   chance 省略 100、キー省略 = 状態異常なし。`pkdx moves` の出力はこの形。
+///   // flinch_chance: ひるみ率 (%)、省略 0。
+///   // recoil_num / recoil_den: 反動 (与ダメ × num / den)、省略 0 / 1。
+///   // self_ko / recharge: じばく系 / 反動ターン、省略 false。
+///   // heal_kind: fixed / weather / drain / rest / leech_seed / pain_split / wish、省略 = 回復なし。
+///   //   heal_num / heal_den は fixed / drain / weather の既定分数、weather は
+///   //   heal_sunny_* (晴れ) と heal_harsh_* (雨・雪・砂)、省略 0 / 1。
+///   // weather_set: sun / rain / sand / snow、field_set: electric / grassy / misty / psychic、
+///   //   省略 = 設定なし。
+///   // 上の 014–016 系キーは `pkdx moves` の出力と同じ形 (DB の値をそのまま流す)。
+///   // 名前だけで決まる効果 (崩れ技 / てっていこうせんの反動 / 技の分類) はキー不要 (name で判定)。
 /// }
 /// ```
 ///
@@ -150,6 +171,8 @@ fn parse_move_json(j : Json, ctx : String) -> @model.Move raise NashCliError {
         Some(Object(se)) => parse_status_effect_object(se)
         _ => None
       }
+      // ひるみ確率 (%)。省略は 0 (ひるみなし)。DB 経路は move_meta.flinch_chance (m019)。
+      let flinch_chance = parse_int_field_or(m, "flinch_chance", 0)
       let recoil_num = match m.get("recoil_num") {
         Some(Number(n, ..)) => n.to_int()
         _ => 0
@@ -239,6 +262,7 @@ fn parse_move_json(j : Json, ctx : String) -> @model.Move raise NashCliError {
         healing,
         weather_set,
         field_set,
+        flinch_chance,
       }
     }
     _ => raise InvalidJson(ctx + " must be an object")
@@ -333,6 +357,21 @@ fn parse_str_field(m : Map[String, Json], key : String) -> String {
   match m.get(key) {
     Some(String(s)) => s
     _ => ""
+  }
+}
+
+///|
+/// トップレベルの optional bool。省略は `None` (未指定)。bool 以外は不正。
+/// ねこだまし と であいがしら の `my_fresh` / `opp_fresh` に使う。select は DB から埋めない。
+fn parse_optional_bool(
+  m : Map[String, Json],
+  key : String,
+) -> Bool? raise NashCliError {
+  match m.get(key) {
+    None => None
+    Some(True) => Some(true)
+    Some(False) => Some(false)
+    Some(_) => raise InvalidJson(key + " must be a boolean")
   }
 }
 
@@ -453,6 +492,7 @@ fn parse_combatant_json(
             healing: None,
             weather_set: None,
             field_set: None,
+            flinch_chance: 0,
           })
           for i in 0..<arr.length() {
             out[i] = parse_move_json(
@@ -973,7 +1013,10 @@ pub fn compute_select_with_team_model(
   child_progress_mode? : String = "off",
   child_progress_every? : Int = 0,
   nash_config? : NashSolverConfig = NashSolverConfig::default(),
-) -> SelectResult raise NashCliError {
+  mc_turn_limit? : Int = MC_TURN_LIMIT,
+  my_fresh? : Bool? = None,
+  opp_fresh? : Bool? = None,
+) -> (SelectResult, @nash.FiniteMatrix) raise NashCliError {
   if team.length() != REQUIRED_TEAM_SIZE ||
     opponent.length() != REQUIRED_TEAM_SIZE {
     raise InvalidJson(
@@ -1001,6 +1044,7 @@ pub fn compute_select_with_team_model(
           parallel,
           input_path,
           refine_turn_limit=refine_tl,
+          mc_turn_limit~,
           progress~,
           child_progress_mode~,
           child_progress_every~,
@@ -1017,9 +1061,12 @@ pub fn compute_select_with_team_model(
           seed,
           keep_top,
           refine_turn_limit=refine_tl,
+          mc_turn_limit~,
           disk~,
           progress~,
           dp_log_every~,
+          my_fresh~,
+          opp_fresh~,
         ) catch {
           err => raise InnerError(@debug.to_string(err))
         }
@@ -1034,6 +1081,8 @@ pub fn compute_select_with_team_model(
         disk~,
         progress~,
         dp_log_every~,
+        my_fresh~,
+        opp_fresh~,
       ) catch {
         err => raise InnerError(@debug.to_string(err))
       }
@@ -1051,7 +1100,7 @@ pub fn compute_select_with_team_model(
     nash_config~,
   )
   progress(PhaseEnd("select-nash"))
-  result
+  (result, matrix)
 }
 
 ///|
@@ -1077,7 +1126,8 @@ fn build_select_result(
   // `solve_with_fallback` raises the same `NashCliError` variants the old
   // direct `solve_zero_sum` callsite mapped to (Infeasible / Unbounded /
   // InnerError), plus `NashFallbackExhausted` when both iterative fallbacks
-  // also exceed `nash_config.tol`.
+  // also exceed `nash_config.tol`. `SimplexFailure` and `InconsistentGame`
+  // both enter that chain; a successful simplex is unchanged.
   let result = solve_with_fallback(matrix, config=nash_config)
   let value = result.value
   let p = strategy_to_array(result.row_strategy)
@@ -1179,7 +1229,8 @@ pub fn run_select_typed(
   parallel? : Int = 1,
   child_progress_mode? : String = "off",
   child_progress_every? : Int = 0,
-) -> SelectResult raise NashCliError {
+  emit_matrix_bits? : Bool = false,
+) -> (SelectResult, String) raise NashCliError {
   let root = @json.parse(input_json) catch {
     err => raise InvalidJson(@debug.to_string(err))
   }
@@ -1222,6 +1273,19 @@ pub fn run_select_typed(
     _ => ()
   }
   let nash_config = parse_nash_solver_config(obj.get("nash_solver_config"))
+  let mc_turn_limit = match obj.get("mc_turn_limit") {
+    Some(Number(n, ..)) => {
+      let v = n.to_int()
+      // The shard CLI reads `--mc-turn-limit <= 0` as "use the default", so a
+      // non-positive value would make parallel and in-process results differ.
+      if v <= 0 {
+        raise InvalidJson("mc_turn_limit must be a positive integer")
+      }
+      v
+    }
+    Some(_) => raise InvalidJson("mc_turn_limit must be a number")
+    None => MC_TURN_LIMIT
+  }
   // For the parallel path the children re-read the same raw JSON
   // (`team_payoff_model` is the auto-upgraded form by then, so the
   // worker also runs auto_upgrade and lands on the same params).
@@ -1248,7 +1312,9 @@ pub fn run_select_typed(
       let _ = @db.unlink_file(input_path)
     }
   }
-  let r = compute_select_with_team_model(
+  let my_fresh = parse_optional_bool(obj, "my_fresh")
+  let opp_fresh = parse_optional_bool(obj, "opp_fresh")
+  let (r, matrix) = compute_select_with_team_model(
     team,
     opp,
     format,
@@ -1261,11 +1327,39 @@ pub fn run_select_typed(
     child_progress_mode~,
     child_progress_every~,
     nash_config~,
+    mc_turn_limit~,
+    my_fresh~,
+    opp_fresh~,
   )
+  let bits = if emit_matrix_bits { matrix_bits_json(matrix) } else { "" }
   if input_path.length() > 0 {
     let _ = @db.unlink_file(input_path)
   }
-  r
+  (r, bits)
+}
+
+///|
+/// JSON array of IEEE-754 hex strings, one per payoff cell. Same token as
+/// the shard wire (`format_shard_cell`), so a byte compare of this field
+/// is a bit compare.
+fn matrix_bits_json(m : @nash.FiniteMatrix) -> String {
+  let mut s = "["
+  let nrows = m.rows()
+  let ncols = m.cols()
+  for i in 0..<nrows {
+    if i > 0 {
+      s = s + ","
+    }
+    s = s + "["
+    for j in 0..<ncols {
+      if j > 0 {
+        s = s + ","
+      }
+      s = s + format_shard_cell(m.at(i, j))
+    }
+    s = s + "]"
+  }
+  s + "]"
 }
 
 ///|
@@ -1273,7 +1367,10 @@ pub fn run_select_typed(
 /// `pkdx select` writes to stdout. Field order matches the historical
 /// `run_select` output so downstream consumers and golden tests are
 /// not invalidated by the typed split.
-pub fn serialize_select_result(r : SelectResult) -> String {
+pub fn serialize_select_result(
+  r : SelectResult,
+  matrix_bits? : String = "",
+) -> String {
   let mut out = "{"
   out = out + "\"format\":\"" + format_label(r.format) + "\""
   out = out + ",\"value\":" + r.value.to_string()
@@ -1285,6 +1382,9 @@ pub fn serialize_select_result(r : SelectResult) -> String {
   out = out + ",\"opp_selection_names\":" + fmt_string_2d(r.opp_selection_names)
   out = out + ",\"row_strategy\":" + fmt_double_array(r.row_strategy)
   out = out + ",\"col_strategy\":" + fmt_double_array(r.col_strategy)
+  if matrix_bits.length() > 0 {
+    out = out + ",\"matrix_bits\":" + matrix_bits
+  }
   out + "}"
 }
 
@@ -1300,8 +1400,9 @@ pub fn run_select(
   parallel? : Int = 1,
   child_progress_mode? : String = "off",
   child_progress_every? : Int = 0,
+  emit_matrix_bits? : Bool = false,
 ) -> String raise NashCliError {
-  let r = run_select_typed(
+  let (r, bits) = run_select_typed(
     input_json,
     disk~,
     progress~,
@@ -1309,21 +1410,34 @@ pub fn run_select(
     parallel~,
     child_progress_mode~,
     child_progress_every~,
+    emit_matrix_bits~,
   )
-  serialize_select_result(r)
+  serialize_select_result(r, matrix_bits=bits)
 }
 
 ///|
 /// Render a 2D `Array[Array[Double]]` payoff sub-matrix as JSON. Used by
 /// the `__select-shard` worker to ship its row-range output to the
 /// parent orchestrator.
+fn fmt_shard_double_row(row : Array[Double]) -> String {
+  let mut s = "["
+  for j in 0..<row.length() {
+    if j > 0 {
+      s = s + ","
+    }
+    s = s + format_shard_cell(row[j])
+  }
+  s + "]"
+}
+
+///|
 fn fmt_double_2d(rows : Array[Array[Double]]) -> String {
   let mut s = "["
   for i in 0..<rows.length() {
     if i > 0 {
       s = s + ","
     }
-    s = s + fmt_double_array(rows[i])
+    s = s + fmt_shard_double_row(rows[i])
   }
   s + "]"
 }
@@ -1377,6 +1491,7 @@ pub fn run_select_shard(
   refine_turn_limit_override? : Int? = None,
   progress? : (ProgressEvent) -> Unit = noop_progress,
   dp_log_every? : Int = 0,
+  rows_csv? : String = "",
 ) -> Unit raise NashCliError {
   let input_json = match @db.read_file(input_path) {
     Some(s) => s
@@ -1432,6 +1547,18 @@ pub fn run_select_shard(
     Some(n) => n
     None => json_refine_tl
   }
+  let my_fresh = parse_optional_bool(obj, "my_fresh")
+  let opp_fresh = parse_optional_bool(obj, "opp_fresh")
+  let row_indices = if rows_csv.length() > 0 {
+    parse_int_csv(rows_csv)
+  } else {
+    let n = if row_end > row_start { row_end - row_start } else { 0 }
+    let xs = Array::make(n, 0)
+    for i in 0..<n {
+      xs[i] = row_start + i
+    }
+    xs
+  }
   // Per-shard cell loop. Unrolled here (instead of delegating to
   // `screen_phase_rows` / `refine_phase_rows`) so the worker can emit a
   // `CellStart` / `CellDone` pair around each per-cell compute. The
@@ -1448,13 +1575,12 @@ pub fn run_select_shard(
       let sel_a = combinations_with_lead(na, k)
       let sel_b = combinations_with_lead(nb, k)
       let size_b = sel_b.length()
-      if row_start < 0 || row_end > sel_a.length() {
-        raise InnerError(@debug.to_string(EmptyCombatants))
-      }
-      let n_rows = if row_end > row_start { row_end - row_start } else { 0 }
-      let out = Array::make(n_rows, ([] : Array[Double]))
-      for i in 0..<n_rows {
-        let i_global = row_start + i
+      let out = Array::make(row_indices.length(), ([] : Array[Double]))
+      for i in 0..<row_indices.length() {
+        let i_global = row_indices[i]
+        if i_global < 0 || i_global >= sel_a.length() {
+          raise InnerError(@debug.to_string(EmptyCombatants))
+        }
         let row = Array::make(size_b, 0.0)
         for j in 0..<size_b {
           progress(
@@ -1469,6 +1595,8 @@ pub fn run_select_shard(
             mc_seed,
             i_global * size_b + j,
             mc_tl,
+            my_fresh~,
+            opp_fresh~,
           )
           progress(
             CellDone(sel_a[i_global], sel_b[j], i_global, j, "screening"),
@@ -1490,13 +1618,12 @@ pub fn run_select_shard(
       let sel_a = combinations_with_lead(na, k)
       let sel_b = combinations_with_lead(nb, k)
       let n_cols = col_keep.length()
-      if row_start < 0 || row_end > row_keep.length() {
-        raise InnerError(@debug.to_string(EmptyCombatants))
-      }
-      let n_rows = if row_end > row_start { row_end - row_start } else { 0 }
-      let out = Array::make(n_rows, ([] : Array[Double]))
-      for i in 0..<n_rows {
-        let i_global = row_start + i
+      let out = Array::make(row_indices.length(), ([] : Array[Double]))
+      for i in 0..<row_indices.length() {
+        let i_global = row_indices[i]
+        if i_global < 0 || i_global >= row_keep.length() {
+          raise InnerError(@debug.to_string(EmptyCombatants))
+        }
         let row = Array::make(n_cols, 0.0)
         for j in 0..<n_cols {
           // Coordinates use original-grid indices (row_keep[i_global],
@@ -1519,6 +1646,8 @@ pub fn run_select_shard(
             refine_tl,
             progress~,
             dp_log_every~,
+            my_fresh~,
+            opp_fresh~,
           )
           progress(
             CellDone(
@@ -1542,6 +1671,7 @@ pub fn run_select_shard(
   let mut out = "{"
   out = out + "\"row_start\":" + row_start.to_string()
   out = out + ",\"row_end\":" + row_end.to_string()
+  out = out + ",\"rows\":" + fmt_int_array(row_indices)
   out = out + ",\"matrix\":" + fmt_double_2d(matrix)
   out = out + "}"
   match @db.write_file_str(output_path, out) {

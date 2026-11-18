@@ -1,6 +1,70 @@
 ///|
-/// Paralyze: 12.5% chance of full-turn failure (gen7+ freeze/paralysis rate).
+/// Paralyze: 12.5% chance of full-turn failure. This is the Champions paralysis
+/// rate (help_syn.json:26071 "The Pokémon has a 12.5% chance of being unable to
+/// use moves"), not a gen7+ rule.
 pub const PARALYZE_SKIP_RATE : Double = 0.125
+
+///|
+/// ねむり (`Sleep(1)`, the 2nd move attempt after falling asleep) の目覚め確率。
+/// Champions 本文 (help_syn.json:26333): "it will have a 1-in-3 chance of being
+/// cured on its second turn". 3 回目 (`Sleep(0)`) は確定で目覚める。
+pub const SLEEP_SECOND_TURN_WAKE_RATE : Double = 0.3333333333333333
+
+///|
+/// こおり (`Freeze(n)`, n >= 1) の 1 回の試行での解凍確率。Champions 本文
+/// (help_syn.json:26184): "has a 25% chance of being cured each time it tries to do
+/// so". Showdown `frz.onBeforeMove` の 20% (`randomChance(1, 5)`) とは異なる。
+pub const FREEZE_THAW_RATE : Double = 0.25
+
+///|
+/// 目覚めて行動する枝 (`wake` の確率で目覚め、その上で命中判定する)。命中は行動、
+/// ハズレは目覚めたまま行動しない (`post_status = None`)。ハズレ枝は技を使ったうえで
+/// 外れた枝なので `miss = true` (崩れ技の外れ判定に使う)。`wake = 1.0` (Sleep(0) /
+/// RestSleep(0)) では従来の確定目覚めと同じ確率 (`1.0 * p` は `p` と一致) になる。
+/// 確率 0 の枝は積まない。
+fn wake_outs(
+  wake : Double,
+  acc_hit : Double,
+  acc_miss : Double,
+  action : ActionKind,
+  outs : Array[SideAttempt],
+) -> Unit {
+  if wake * acc_hit > 0.0 {
+    outs.push({
+      prob: wake * acc_hit,
+      acts: true,
+      action,
+      post_status: @model.None,
+      miss: false,
+    })
+  }
+  if wake * acc_miss > 0.0 {
+    outs.push({
+      prob: wake * acc_miss,
+      acts: false,
+      action,
+      post_status: @model.None,
+      miss: true,
+    })
+  }
+}
+
+///|
+/// 同ターンに後攻が眠らされた (`action_blocked_by_fresh_status`) ときの後攻の
+/// 状態。その後攻の眠りの 1 回目の行動試行は着弾ターンに起きて確定で眠ったまま
+/// なので、カウンタを 1 つ進める (`Sleep(2)` → `Sleep(1)`)。次のターンが 2 回目
+/// (1/3 の目覚め) になる。先攻は行動後に眠るため 1 回目は翌ターン (= 通常の
+/// `Sleep(2)` のまま)。Showdown `slp.onBeforeMove` は後攻の着弾ターンにも走る。
+/// Champions 本文「ねむり状態になってから 1 度目は技が使えない」(jpn help_syn.json:23848)
+/// も行動試行単位と読める。
+pub fn consume_sleep_attempt_on_block(
+  s : @model.StatusCondition,
+) -> @model.StatusCondition {
+  match s {
+    @model.Sleep(n) => if n > 1 { @model.Sleep(n - 1) } else { s }
+    _ => s
+  }
+}
 
 ///|
 /// Enumerate the attempt outcomes for a side given its current status, the
@@ -24,16 +88,17 @@ pub fn per_side_attempt(
   must_recharge : Bool,
   action : ActionKind,
   accuracy : Int,
+  thaws_user? : Bool = false,
 ) -> Array[SideAttempt] {
   if must_recharge {
     match action {
       UseMove(_) | Mega(_) =>
-        return [{ prob: 1.0, acts: false, action, post_status: status }]
+        return [{ prob: 1.0, acts: false, action, post_status: status, miss: false }]
       Switch(_) => ()
     }
   }
   let acts_only : Array[SideAttempt] = [
-    { prob: 1.0, acts: true, action, post_status: status },
+    { prob: 1.0, acts: true, action, post_status: status, miss: false },
   ]
   match action {
     Switch(_) => acts_only
@@ -43,31 +108,66 @@ pub fn per_side_attempt(
       let outs : Array[SideAttempt] = []
       match status {
         @model.Sleep(n) =>
-          if n > 0 {
+          if n >= 2 {
+            // 眠り始めの 1 回目 (Sleep(2)) 以降も確定で眠ったまま。
             outs.push({
               prob: 1.0,
               acts: false,
               action,
               post_status: @model.Sleep(n - 1),
+              miss: false,
+            })
+          } else if n == 1 {
+            // 2 回目: 2/3 で眠ったまま (Sleep(0) へ)、1/3 で目覚めて行動。
+            outs.push({
+              prob: 1.0 - SLEEP_SECOND_TURN_WAKE_RATE,
+              acts: false,
+              action,
+              post_status: @model.Sleep(0),
+              miss: false,
+            })
+            wake_outs(
+              SLEEP_SECOND_TURN_WAKE_RATE,
+              acc_hit,
+              acc_miss,
+              action,
+              outs,
+            )
+          } else {
+            // Sleep(0): 3 回目。確定で目覚めて行動 (命中判定あり)。
+            wake_outs(1.0, acc_hit, acc_miss, action, outs)
+          }
+        @model.RestSleep(n) =>
+          // ねむる由来: 1 / 2 回目は確定で眠ったまま、3 回目で目覚める (抽選なし)。
+          if n > 0 {
+            outs.push({
+              prob: 1.0,
+              acts: false,
+              action,
+              post_status: @model.RestSleep(n - 1),
+              miss: false,
             })
           } else {
-            // Sleep(0): this turn is the wake-up; act normally afterward.
-            if acc_hit > 0.0 {
-              outs.push({
-                prob: acc_hit,
-                acts: true,
-                action,
-                post_status: @model.None,
-              })
-            }
-            if acc_miss > 0.0 {
-              outs.push({
-                prob: acc_miss,
-                acts: false,
-                action,
-                post_status: @model.None,
-              })
-            }
+            wake_outs(1.0, acc_hit, acc_miss, action, outs)
+          }
+        @model.Freeze(n) =>
+          if thaws_user {
+            // 解凍技 (defrost) は使用者を行動前に解凍する (乱数なし)。命中判定あり。
+            // 外れても解凍は起きる (Showdown `onModifyMove` の cure は命中より前)。
+            wake_outs(1.0, acc_hit, acc_miss, action, outs)
+          } else if n >= 1 {
+            // 試行ごとに 25% で解凍して行動 (命中判定あり)、75% で凍ったまま (Freeze(n-1))。
+            outs.push({
+              prob: 1.0 - FREEZE_THAW_RATE,
+              acts: false,
+              action,
+              post_status: @model.Freeze(n - 1),
+              miss: false,
+            })
+            wake_outs(FREEZE_THAW_RATE, acc_hit, acc_miss, action, outs)
+          } else {
+            // Freeze(0): 3 回目の試行で確定解凍して行動 (命中判定あり)。
+            wake_outs(1.0, acc_hit, acc_miss, action, outs)
           }
         @model.Paralyze => {
           outs.push({
@@ -75,6 +175,7 @@ pub fn per_side_attempt(
             acts: false,
             action,
             post_status: @model.Paralyze,
+            miss: false,
           })
           let non_para = 1.0 - PARALYZE_SKIP_RATE
           if acc_hit > 0.0 {
@@ -83,6 +184,7 @@ pub fn per_side_attempt(
               acts: true,
               action,
               post_status: @model.Paralyze,
+              miss: false,
             })
           }
           if acc_miss > 0.0 {
@@ -91,12 +193,13 @@ pub fn per_side_attempt(
               acts: false,
               action,
               post_status: @model.Paralyze,
+              miss: true,
             })
           }
         }
         _ => {
           if acc_hit > 0.0 {
-            outs.push({ prob: acc_hit, acts: true, action, post_status: status })
+            outs.push({ prob: acc_hit, acts: true, action, post_status: status, miss: false })
           }
           if acc_miss > 0.0 {
             outs.push({
@@ -104,6 +207,7 @@ pub fn per_side_attempt(
               acts: false,
               action,
               post_status: status,
+              miss: true,
             })
           }
         }
@@ -151,6 +255,326 @@ pub fn field_blocks_status(
 }
 
 ///|
+/// 追加効果の状態異常 (`kind`) を止める対象側の特性・天候のうち、りんぷん / こおり専用
+/// (DP `maybe_apply_status_fanout` と MC `mc_try_apply_status` の共通 SSoT)。
+/// じゅうなん / めんえき / すいほう / ねつこうかん / きよめのしお / リーフガード /
+/// フラワーベールは `ability_blocks_status` (`status_blocked_by_holder_ability`)
+/// が変化技・追加効果・あくびをまとめて止める。ここには入れない。
+/// - りんぷん (Shield Dust): "immune to additional effects from attacks"
+///   (tokuseiinfo_syn.json:606)。ダメージ技の追加効果 (`power > 0`) を全 kind で止める。
+///   変化技の直接の状態異常は止めない。
+/// - マグマのよろい: "The Pokémon cannot be frozen." (tokuseiinfo_syn.json:1348)。こおり だけ。
+/// - はれ (`Weather::Sun`): 本文 (help_syn.json:27747 Harsh Sunlight) は凍結に触れないので
+///   Showdown `sunnyday.onImmunity` (frz → false) を採用する。こおり だけ。
+pub fn secondary_blocked_by_holder(
+  state : SwitchingGameState,
+  target_is_me : Bool,
+  target_slot : Int,
+  target_team : Array[Combatant],
+  kind : @model.StatusKind,
+  mv : @model.Move,
+  attacker_ability? : String = "",
+) -> Bool {
+  let freeze_only = kind == @model.FreezeKind
+  if mv.power <= 0 && !freeze_only {
+    return false
+  }
+  if freeze_only && state.weather == @model.Weather::Sun {
+    return true
+  }
+  if target_slot < 0 || target_slot >= target_team.length() {
+    return false
+  }
+  let megaed = if target_is_me {
+    state.my_megaed
+  } else {
+    state.opp_megaed
+  }
+  let is_mega = target_slot < megaed.length() && megaed[target_slot]
+  let ability0 = effective_combatant(target_team[target_slot], is_mega).ability
+  let ability = defender_ability_for_move(attacker_ability, ability0)
+  (mv.power > 0 && ability_blocks_secondary(ability)) ||
+    (freeze_only && ability_blocks_freeze(ability))
+}
+
+///|
+/// 対象の特性が `kind` の付与を止めるか (DP)。メガ後の特性とタイプで
+/// `ability_blocks_status` を読む。変化技・追加効果・あくび (DrowsyKind) の
+/// 共通ゲート。ねむる (自分への付与) はここを通さない。
+fn status_blocked_by_holder_ability(
+  state : SwitchingGameState,
+  target_is_me : Bool,
+  target_slot : Int,
+  target_team : Array[Combatant],
+  kind : @model.StatusKind,
+  attacker_ability? : String = "",
+) -> Bool {
+  if target_slot < 0 || target_slot >= target_team.length() {
+    return false
+  }
+  let megaed = if target_is_me {
+    state.my_megaed
+  } else {
+    state.opp_megaed
+  }
+  let is_mega = target_slot < megaed.length() && megaed[target_slot]
+  let eff = effective_combatant(target_team[target_slot], is_mega)
+  ability_blocks_status(
+    defender_ability_for_move(attacker_ability, eff.ability),
+    kind,
+    weather=state.weather,
+    type1=eff.pokemon.type1,
+    type2=eff.pokemon.type2,
+  )
+}
+
+///|
+/// 攻撃側の事情と命中結果で、この技の追加効果 (`status_effect`) が付かない場合に写しを返す (DP)。
+/// 返り値は `mv` 自体か、`status_effect = None` にした写し。解凍 (`with_thaw` / thawsTarget)、
+/// 反動、ドレイン、能力変化は対象外で従来どおり。
+/// - 変化技 (`power = 0`): 追加効果ではないので触らない (命中は別経路で抽選済み)。
+/// - `hp_lost <= 0`: この命中で相手の HP が 1 も減らなかった (瀕死の対象)。タイプ無効 / 特性無効
+///   (`hits_count = 0`) は呼び出し元が先に抜けるので、ここには来ない。`hp_lost` は ばけのかわ の
+///   chip を含む: 初撃吸収の命中は chip (最大 HP / 8) で HP が減るので `hp_lost > 0` となり、
+///   追加効果は付く。Showdown の `disguise.onDamage` は 0 を返すが `spreadMoveHit` は 0 ダメージの
+///   対象を残して secondaries を走らせるため、この規則を採る (Showdown fallback。Champions 本文
+///   tokuseiinfo_syn.json:6600 は chip だけを述べ、追加効果には触れない)。命中で倒れた対象には
+///   `maybe_apply_status_fanout` が HP 0 を見て付与しない。
+/// - ちからずく (Sheer Force) の使用者: 追加効果を失う (`ability_strips_secondaries`)。
+pub fn secondary_gated_move(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  attacker_team : Array[Combatant],
+  mv : @model.Move,
+  hp_lost : Int,
+) -> @model.Move {
+  // 変化技 (`power = 0`): 直接の状態異常 (`status_effect`) は追加効果ではないので触らない。
+  // ひるみ (`flinch_chance`) は追加効果なので、変化技に付いていれば落とす (現データには無い)。
+  if mv.power <= 0 {
+    return if mv.flinch_chance > 0 { { ..mv, flinch_chance: 0 } } else { mv }
+  }
+  // 追加効果 (状態異常 / ひるみ) をすべて落とした写し。能力変化は残す。
+  // ちからずく の 1.3 倍が乗る集合は `move_has_sheer_force_effect` (この写しで
+  // 消える chance > 0 の状態異常と flinch_chance)。
+  let no_secondary = @damage.clear_damaging_secondaries(mv)
+  if hp_lost <= 0 {
+    return no_secondary
+  }
+  if attacker_slot < 0 || attacker_slot >= attacker_team.length() {
+    return mv
+  }
+  let megaed = if attacker_is_me {
+    state.my_megaed
+  } else {
+    state.opp_megaed
+  }
+  let is_mega = attacker_slot < megaed.length() && megaed[attacker_slot]
+  let ability = effective_combatant(attacker_team[attacker_slot], is_mega).ability
+  if ability_strips_secondaries(ability) {
+    return no_secondary
+  }
+  mv
+}
+
+///|
+/// ひるみの対象側の特性による遮断 (DP / MC 共通の判定。ability 文字列の SSoT)。
+/// せいしんりょく は ひるみ そのものを受けない。りんぷん はダメージ技の追加効果を全て止める
+/// (`secondary_blocked_by_holder` の状態異常と同じ判定)。
+pub fn flinch_blocked_by_ability(ability : String, mv : @model.Move) -> Bool {
+  ability_blocks_flinch(ability) || (mv.power > 0 && ability_blocks_secondary(ability))
+}
+
+///|
+/// ひるみの対象側の遮断判定 (DP)。メガ後の特性は `effective_combatant` で読む。
+pub fn flinch_blocked_by_holder(
+  state : SwitchingGameState,
+  target_is_me : Bool,
+  target_slot : Int,
+  target_team : Array[Combatant],
+  mv : @model.Move,
+  attacker_ability? : String = "",
+) -> Bool {
+  if target_slot < 0 || target_slot >= target_team.length() {
+    return false
+  }
+  let megaed = if target_is_me { state.my_megaed } else { state.opp_megaed }
+  let is_mega = target_slot < megaed.length() && megaed[target_slot]
+  let ability0 = effective_combatant(target_team[target_slot], is_mega).ability
+  flinch_blocked_by_ability(
+    defender_ability_for_move(attacker_ability, ability0),
+    mv,
+  )
+}
+
+///|
+/// ひるみ成立確率。`chance` (%) の抽選を `hits` 回の独立な命中で行ったときに 1 回以上成立する
+/// 確率 `1 - (1 - p)^hits`。状態異常の `maybe_apply_status_fanout` の多段規則と同じ。
+/// `hits < 1` は 1 回として扱う (命中 0 回 = 免疫 / 外れは呼び出し側が先に抜ける)。
+pub fn flinch_probability(chance : Int, hits : Int) -> Double {
+  if chance <= 0 {
+    return 0.0
+  }
+  let p = if chance >= 100 { 1.0 } else { chance.to_double() / 100.0 }
+  let n = if hits < 1 { 1 } else { hits }
+  let mut q = 1.0
+  for _i = 0; _i < n; _i = _i + 1 {
+    q = q * (1.0 - p)
+  }
+  1.0 - q
+}
+
+///|
+/// 対象側のターン内ひるみフラグを立てる。
+fn with_flinched(
+  state : SwitchingGameState,
+  target_is_me : Bool,
+) -> SwitchingGameState {
+  if target_is_me {
+    { ..state, my_flinched: true }
+  } else {
+    { ..state, opp_flinched: true }
+  }
+}
+
+///|
+/// 追加効果としてのひるみ抽選 (DP `apply_damage_variants_fanout` の post-hit 段)。`mv` は
+/// `secondary_gated_move` 済み (ちからずく / HP 減少なしでは `flinch_chance = 0`)。対象がこの
+/// 命中で生存し、対象の特性で遮断されないときだけ抽選する。成立は命中数 `hits_count` の独立
+/// 抽選 (`flinch_probability`)。成立した枝にだけ対象側の `*_flinched` を立てる。
+///
+/// ひるみは対象がまだ行動していない (後攻) ときにだけ効く。その判定は行動時点で行う:
+/// `flinch_roll_deferred` が後攻の試行を遅らせ、`resolve_pending_attempt` がフラグを読む。
+pub fn maybe_apply_flinch_fanout(
+  state : SwitchingGameState,
+  target_is_me : Bool,
+  target_slot : Int,
+  target_team : Array[Combatant],
+  mv : @model.Move,
+  hits_count? : Int = 1,
+  attacker_ability? : String = "",
+) -> Array[(Double, SwitchingGameState)] {
+  // ねこだまし は使用者の fresh が Some(true) のときだけ既存のひるみ経路に乗せる。
+  // None / Some(false) は確率 100 でもひるませない (未指定の回帰入力を変えない)。
+  let user_fresh = if target_is_me { state.opp_fresh } else { state.my_fresh }
+  let chance = flinch_chance_if_fresh(mv, user_fresh)
+  if chance <= 0 {
+    return [(1.0, state)]
+  }
+  let target_hps = if target_is_me { state.my_hps } else { state.opp_hps }
+  if target_slot < 0 || target_slot >= target_hps.length() {
+    return [(1.0, state)]
+  }
+  if target_hps[target_slot] <= 0 {
+    return [(1.0, state)]
+  }
+  if flinch_blocked_by_holder(
+    state, target_is_me, target_slot, target_team, mv, attacker_ability~,
+  ) {
+    return [(1.0, state)]
+  }
+  let p = flinch_probability(chance, hits_count)
+  if p <= 0.0 {
+    return [(1.0, state)]
+  }
+  if p >= 1.0 {
+    return [(1.0, with_flinched(state, target_is_me))]
+  }
+  [(1.0 - p, state), (p, with_flinched(state, target_is_me))]
+}
+
+///|
+/// ひるみが成立した試行の分布 (DP / MC 共通の SSoT)。ひるみで行動を止められた側について、
+/// 行動前の状態判定を Showdown の優先度順で評価した結果を返す。ひるみで技を出さないので命中判定
+/// は無く、外れ (崩れ技の自傷) も起きない。
+///
+/// 戻り値は (確率, 事後状態, ふくつのこころ が発火するか)。発火 = 行動前にひるみが効いた。
+/// - 眠り (Sleep(n >= 2) / RestSleep(n > 0)) と 凍結 (Freeze(n >= 1), 解凍前): 状態判定で止まり
+///   ひるみは到達しない (発火なし)。Sleep(1) / Freeze(n >= 1) の目覚め / 解凍は到達 (発火)。
+/// - 眠り 3 回目 (Sleep(0) / RestSleep(0)) と Freeze(0): 確定で目覚め / 解凍し、ひるみが効く (発火)。
+/// - defrost 技の使用者 (`thaws_user`): frz は defrost 技の判定を素通りし、ひるみが効く (発火)。
+///   解凍は技の実行時に起きるので、止められた場合は凍ったまま。
+/// - まひ: ひるみ (優先度 8) が まひ (優先度 1) より先に効くので、まひ判定は行わず発火。
+/// - それ以外 (None / やけど / どく / もうどく / あくび予告): 発火。
+///
+/// 根拠 (Showdown `data/conditions.ts`): flinch は onBeforeMovePriority 8 で `runEvent('Flinch')`
+/// を呼び、slp / frz は 10、par は 1、mustrecharge は 11。ふくつのこころ は 'Flinch' event で発火。
+/// Champions 本文には優先度の記述が無いため Showdown に従う。
+pub fn flinched_outcomes(
+  status : @model.StatusCondition,
+  thaws_user : Bool,
+) -> Array[(Double, @model.StatusCondition, Bool)] {
+  match status {
+    @model.Sleep(n) =>
+      if n >= 2 {
+        [(1.0, @model.Sleep(n - 1), false)]
+      } else if n == 1 {
+        [
+          (1.0 - SLEEP_SECOND_TURN_WAKE_RATE, @model.Sleep(0), false),
+          (SLEEP_SECOND_TURN_WAKE_RATE, @model.None, true),
+        ]
+      } else {
+        [(1.0, @model.None, true)]
+      }
+    @model.RestSleep(n) =>
+      if n > 0 {
+        [(1.0, @model.RestSleep(n - 1), false)]
+      } else {
+        [(1.0, @model.None, true)]
+      }
+    @model.Freeze(n) =>
+      if thaws_user {
+        [(1.0, status, true)]
+      } else if n >= 1 {
+        [
+          (1.0 - FREEZE_THAW_RATE, @model.Freeze(n - 1), false),
+          (FREEZE_THAW_RATE, @model.None, true),
+        ]
+      } else {
+        [(1.0, @model.None, true)]
+      }
+    _ => [(1.0, status, true)]
+  }
+}
+
+///|
+/// 解凍 (こおり → None)。対象スロットの状態がこおりでなければ state をそのまま返す。
+pub fn with_thaw(
+  state : SwitchingGameState,
+  target_is_me : Bool,
+  target_slot : Int,
+) -> SwitchingGameState {
+  let cur = if target_is_me {
+    state.my_status[target_slot]
+  } else {
+    state.opp_status[target_slot]
+  }
+  match cur {
+    @model.Freeze(_) =>
+      if target_is_me {
+        {
+          ..state,
+          my_status: override_active_status(
+            state.my_status,
+            target_slot,
+            @model.None,
+          ),
+        }
+      } else {
+        {
+          ..state,
+          opp_status: override_active_status(
+            state.opp_status,
+            target_slot,
+            @model.None,
+          ),
+        }
+      }
+    _ => state
+  }
+}
+
+///|
 /// Produce probabilistic next-state outcomes for a status-effect fan-out.
 /// Given `state_after_dmg` (already updated for damage and stat boosts) plus
 /// the attacking `move` and the target slot, returns either a single 1.0
@@ -168,6 +592,7 @@ pub fn maybe_apply_status_fanout(
   target_team : Array[Combatant],
   mv : @model.Move,
   hits_count? : Int = 1,
+  attacker_ability? : String = "",
 ) -> Array[(Double, SwitchingGameState)] {
   let eff = match mv.status_effect {
     None => return [(1.0, state)]
@@ -191,11 +616,69 @@ pub fn maybe_apply_status_fanout(
     return [(1.0, state)]
   }
   let combatant = target_team[target_slot]
-  if @model.immune_to_status(
+  // 変化技のタイプ・特性免疫は着弾する側 (メガ後、Protean はメガ中は外す)。
+  // ダメージ技の追加効果は従来どおり素のタイプと `status_blocked_by_holder_ability`
+  // のまま。ここを変えると追加効果の分岐がずれる。
+  if mv.power <= 0 {
+    let target_megaed = if target_is_me {
+      state.my_megaed
+    } else {
+      state.opp_megaed
+    }
+    let is_mega = target_slot < target_megaed.length() &&
+      target_megaed[target_slot]
+    let protean = if is_mega {
+      ""
+    } else {
+      protean_locked_of(state, target_is_me, target_slot)
+    }
+    let eff = effective_combatant(
+      combatant,
+      is_mega,
+      protean_locked=protean,
+    )
+    if @model.immune_to_status(kind, eff.pokemon.type1, eff.pokemon.type2) ||
+      ability_blocks_status(
+        defender_ability_for_move(attacker_ability, eff.ability),
+        kind,
+        weather=state.weather,
+        type1=eff.pokemon.type1,
+        type2=eff.pokemon.type2,
+        self_inflicted=false,
+      ) {
+      return [(1.0, state)]
+    }
+  } else {
+    if @model.immune_to_status(
       kind,
       combatant.pokemon.type1,
       combatant.pokemon.type2,
     ) {
+      return [(1.0, state)]
+    }
+    // 特性の状態異常免疫 (じゅうなん / めんえき / すいほう / ねつこうかん /
+    // きよめのしお / リーフガード / フラワーベール)。変化技・追加効果・あくび。
+    if status_blocked_by_holder_ability(
+      state,
+      target_is_me,
+      target_slot,
+      target_team,
+      kind,
+      attacker_ability~,
+    ) {
+      return [(1.0, state)]
+    }
+  }
+  // りんぷん (ダメージ技の追加効果) / マグマのよろい・はれ (こおり): `secondary_blocked_by_holder`。
+  if secondary_blocked_by_holder(
+    state,
+    target_is_me,
+    target_slot,
+    target_team,
+    kind,
+    mv,
+    attacker_ability~,
+  ) {
     return [(1.0, state)]
   }
   // Stage G-2 / H: terrain blocks status infliction on grounded defenders.
@@ -222,7 +705,7 @@ pub fn maybe_apply_status_fanout(
     if @damage.is_grounded(
         type1=eff.pokemon.type1,
         type2=eff.pokemon.type2,
-        ability=eff.ability,
+        ability=defender_ability_for_move(attacker_ability, eff.ability),
         item=eff.item,
       ) {
       return [(1.0, state)]
@@ -350,26 +833,17 @@ pub fn apply_contact_proc_fanout(
   if @damage.check_def_immunity(defender.ability, resolved_move_type) {
     return [(1.0, state)]
   }
-  match @types.type_from_jp(resolved_move_type) {
-    Some(at) =>
-      match @types.type_from_jp(defender.pokemon.type1) {
-        Some(d1) => {
-          let e1 = @types.get_effectiveness_x4(at, d1)
-          let e2 = if defender.pokemon.type2.length() > 0 {
-            match @types.type_from_jp(defender.pokemon.type2) {
-              Some(d2) => @types.get_effectiveness_x4(at, d2)
-              None => 4
-            }
-          } else {
-            4
-          }
-          if e1 == 0 || e2 == 0 {
-            return [(1.0, state)]
-          }
-        }
-        None => ()
-      }
-    None => ()
+  // タイプ無効は engine と同じ move_effectiveness_slots_x4。
+  // フライングプレスはかくとう無効 (ゴースト) をひこう側が打ち消さない。
+  // フリーズドライのみず上書きもここを通る (無効にはならない)。
+  let (e1, e2) = @damage.move_effectiveness_slots_x4(
+    mv.name,
+    resolved_move_type,
+    defender.pokemon.type1,
+    defender.pokemon.type2,
+  )
+  if e1 == 0 || e2 == 0 {
+    return [(1.0, state)]
   }
   // 各 hit 内で defender の ability proc → item proc の順に独立判定する
   // (Showdown / Gen9 仕様)。両者を一つの categorical roll に畳むと
@@ -411,6 +885,16 @@ pub fn apply_contact_proc_fanout(
       ) {
       continue
     }
+    // 攻撃側の特性がこの状態を受けない (本文は付与源を限定しない。接触特性も止める)。
+    if ability_blocks_status(
+      attacker.ability,
+      kind,
+      weather=state.weather,
+      type1=attacker.pokemon.type1,
+      type2=attacker.pokemon.type2,
+    ) {
+      continue
+    }
     viable_ability_chance = viable_ability_chance + chance
     viable_ability.push((kind, chance))
   }
@@ -426,6 +910,17 @@ pub fn apply_contact_proc_fanout(
         attacker.pokemon.type1,
         attacker.pokemon.type2,
       ) {
+      continue
+    }
+    // 接触持ち物 (とびだすハバネロ / とびだすなかみ) も同じ免疫。help_11_02_00 は
+    // 状態異常の源に held item を含む。
+    if ability_blocks_status(
+      attacker.ability,
+      kind,
+      weather=state.weather,
+      type1=attacker.pokemon.type1,
+      type2=attacker.pokemon.type2,
+    ) {
       continue
     }
     viable_item_chance = viable_item_chance + chance
@@ -853,6 +1348,10 @@ fn with_status_set(
     opp_item_consumed: state.opp_item_consumed.copy(),
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used: state.my_moves_used.copy(),
     opp_moves_used: state.opp_moves_used.copy(),
     weather: state.weather,
@@ -865,13 +1364,29 @@ fn with_status_set(
     opp_wish_turns: state.opp_wish_turns,
     field: state.field,
     field_turns_left: state.field_turns_left,
+    my_flash_fire: state.my_flash_fire.copy(),
+    opp_flash_fire: state.opp_flash_fire.copy(),
     turn: state.turn,
   }
 }
 
 ///|
+/// やけど / どく / もうどく のターン終了ダメージの分母。
+///
+/// バトルの HP プール、初期 HP、終端の HP 比は `pokemon.hp` (実数値) を使う。
+/// `effective_hp` は同じ数を種族値とみなして Lv50 の投資込み HP を返すので、
+/// `actual_stats` が無いときはプールより大きい。slip の分母にそれを使うと
+/// 1/16・1/8 より大きい割合になり、DP (16 乱数の平均) と MC (16 乱数の 1 つ)
+/// が瀕死の閾値のどちら側にいるかで値が割れる。砂・たべのこし・やどりぎ は
+/// 従来どおり `effective_hp`。
+fn status_slip_max_hp(c : Combatant) -> Int {
+  c.pokemon.hp
+}
+
+///|
 /// Apply one end-of-turn slip / counter update for the given active slot.
 /// Returns `(new_hp, new_status)`. HP never falls below 0 from slip damage.
+/// `max_hp` is the battle pool (`status_slip_max_hp`), not `effective_hp`.
 /// - Burn / Poison: subtract max_hp / 16 or max_hp / 8 respectively.
 /// - BadPoison(n): subtract max_hp * min(n+1, TOXIC_MAX_TICKS) / 16 and
 ///   advance to BadPoison(min(n+1, TOXIC_MAX_TICKS)).
@@ -880,6 +1395,10 @@ pub fn eot_slip_active(
   current_hp : Int,
   max_hp : Int,
   status : @model.StatusCondition,
+  ability? : String = "",
+  weather? : @model.Weather = @model.Weather::None,
+  type1? : String = "",
+  type2? : String = "",
 ) -> (Int, @model.StatusCondition) {
   if current_hp <= 0 {
     return (current_hp, status)
@@ -900,13 +1419,48 @@ pub fn eot_slip_active(
     }
     @model.Drowsy(n) =>
       // n>0: まだ猶予あり、カウンタを 1 減らす。n==0: ここでねむり発動。
+      // 眠りを止める特性なら予告だけ消す。Showdown `yawn.onResidual` は volatile を
+      // 外してから trySetStatus し、免疫で失敗すると眠らない。本文は順序を書かない。
       if n > 0 {
         (current_hp, @model.Drowsy(n - 1))
+      } else if ability_blocks_status(
+        ability,
+        @model.SleepKind,
+        weather~,
+        type1~,
+        type2~,
+      ) {
+        (current_hp, @model.None)
       } else {
         (current_hp, @model.Sleep(2))
       }
     _ => (current_hp, status)
   }
+}
+
+///|
+/// あくび発動時にメガ後の特性・タイプと現在の天候を `eot_slip_active` へ渡す。
+/// 分母は raw の HP プール (メガは HP を変えない)。
+fn eot_slip_holder(
+  state : SwitchingGameState,
+  holder_is_me : Bool,
+  team : Array[Combatant],
+  hps : Array[Int],
+  status : Array[@model.StatusCondition],
+) -> (Int, @model.StatusCondition) {
+  let slot = if holder_is_me { state.my_active } else { state.opp_active }
+  let megaed = if holder_is_me { state.my_megaed } else { state.opp_megaed }
+  let is_mega = slot < megaed.length() && megaed[slot]
+  let eff = effective_combatant(team[slot], is_mega)
+  eot_slip_active(
+    hps[slot],
+    status_slip_max_hp(team[slot]),
+    status[slot],
+    ability=eff.ability,
+    weather=state.weather,
+    type1=eff.pokemon.type1,
+    type2=eff.pokemon.type2,
+  )
 }
 
 ///|
@@ -946,7 +1500,7 @@ pub fn eot_leftovers_heal(current_hp : Int, max_hp : Int, item : String) -> Int 
 /// Stage 12 (EOT 順序整理): tick blocks are arranged in the Gen9 mainline
 /// "residual" order. Plan H-2 specifies the canonical sequence as:
 ///
-///   1. 天候ダメ (Sand chip on non-はがね/いわ/じめん, non-immune ability)
+///   1. 天候ダメ (Sand chip、かんそうはだの雨 1/8 回復 / 日照 1/8 ダメージ)
 ///   2. アイテム回復 (たべのこし)
 ///   3. やどりぎのタネ tick
 ///   4. 状態異常スリップ (Burn / Poison / BadPoison / Drowsy → Sleep)
@@ -1017,7 +1571,10 @@ pub fn apply_eot(
   // an Aerodactyl that megas into Rock-typed form will not take Sand chip on
   // the same turn it megas (and pre-mega it was Rock anyway, so this is
   // mostly insurance). Other weathers (Rain / Sun / Snow / None) deal no
-  // chip damage in Gen9 (Hail was retired in favour of Snow).
+  // sand chip in Gen9 (Hail was retired in favour of Snow).
+  // かんそうはだの雨 1/8 回復と日照 1/8 ダメージは同じ天候 residual
+  // なので砂チップの直後、たべのこしの前。天候は排他で、特性が違う側は
+  // HP を書かない。
   apply_sand_damage_active(
     state.my_active,
     my_hps,
@@ -1027,6 +1584,22 @@ pub fn apply_eot(
     state.weather,
   )
   apply_sand_damage_active(
+    state.opp_active,
+    opp_hps,
+    opp_team,
+    state.opp_megaed,
+    opp_max,
+    state.weather,
+  )
+  apply_dry_skin_weather_active(
+    state.my_active,
+    my_hps,
+    my_team,
+    state.my_megaed,
+    my_max,
+    state.weather,
+  )
+  apply_dry_skin_weather_active(
     state.opp_active,
     opp_hps,
     opp_team,
@@ -1155,21 +1728,27 @@ pub fn apply_eot(
 
   // === Step 4: 状態異常 slip ===
   // Burn / Poison / BadPoison / Drowsy → Sleep の counter 遷移を含む。
+  // 分母はバトルの HP プール (`status_slip_max_hp`)。`my_max` / `opp_max`
+  // (`effective_hp`) は砂・回復・やどりぎ用で、slip には使わない。
   // `eot_slip_active` は HP<=0 で早期 return するので、Sand or Leech で HP=0
   // になったスロットは status slip を観測しない (= HP は不変、status counter
   // も不変)。これは mainline 挙動 (faint 後の status は燃え尽きない / Toxic
   // counter は death で凍結) と一致する。
-  let (my_hp_new, my_st_new) = eot_slip_active(
-    my_hps[state.my_active],
-    my_max,
-    my_status[state.my_active],
+  let (my_hp_new, my_st_new) = eot_slip_holder(
+    state,
+    true,
+    my_team,
+    my_hps,
+    my_status,
   )
   my_hps[state.my_active] = my_hp_new
   my_status[state.my_active] = my_st_new
-  let (opp_hp_new, opp_st_new) = eot_slip_active(
-    opp_hps[state.opp_active],
-    opp_max,
-    opp_status[state.opp_active],
+  let (opp_hp_new, opp_st_new) = eot_slip_holder(
+    state,
+    false,
+    opp_team,
+    opp_hps,
+    opp_status,
   )
   opp_hps[state.opp_active] = opp_hp_new
   opp_status[state.opp_active] = opp_st_new
@@ -1255,13 +1834,23 @@ pub fn apply_eot(
   } else {
     (state.field, 0)
   }
+  // しろいハーブ: 残り HP 処理 (Showdown onResidual)。EOT はランクを変えないので、
+  // 実到達では no-op。判定点の対応を残すために両 active で呼ぶ (held_item_stat_reset.mbt)。
+  let my_ranks = state.my_ranks.copy()
+  let opp_ranks = state.opp_ranks.copy()
+  let my_item_consumed = state.my_item_consumed.copy()
+  let opp_item_consumed = state.opp_item_consumed.copy()
+  apply_held_item_stat_reset_pair(
+    my_team, state.my_active, my_hps, my_ranks, my_item_consumed,
+    opp_team, state.opp_active, opp_hps, opp_ranks, opp_item_consumed,
+  )
   {
     my_active: state.my_active,
     opp_active: state.opp_active,
     my_hps,
     opp_hps,
-    my_ranks: state.my_ranks.copy(),
-    opp_ranks: state.opp_ranks.copy(),
+    my_ranks,
+    opp_ranks,
     my_mega_used: state.my_mega_used,
     opp_mega_used: state.opp_mega_used,
     my_megaed: state.my_megaed.copy(),
@@ -1270,10 +1859,14 @@ pub fn apply_eot(
     opp_status,
     my_must_recharge: state.my_must_recharge.copy(),
     opp_must_recharge: state.opp_must_recharge.copy(),
-    my_item_consumed: state.my_item_consumed.copy(),
-    opp_item_consumed: state.opp_item_consumed.copy(),
+    my_item_consumed,
+    opp_item_consumed,
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used: state.my_moves_used.copy(),
     opp_moves_used: state.opp_moves_used.copy(),
     weather: next_weather,
@@ -1291,6 +1884,8 @@ pub fn apply_eot(
     // 前の最後の効果" を成立させる)。
     field: next_field,
     field_turns_left: next_field_turns,
+    my_flash_fire: state.my_flash_fire.copy(),
+    opp_flash_fire: state.opp_flash_fire.copy(),
     turn: state.turn,
   }
 }
@@ -1386,6 +1981,57 @@ pub fn apply_sand_damage_active(
 }
 
 ///|
+/// Weather residual for かんそうはだ, in the same slot as sand chip and before
+/// leftovers. Champions `tokuseiinfo_syn.json` `TOKUSEIINFO_SYN_087`
+/// (`champout` `50e7233`):
+///
+/// - あめ: restore `max_hp / 8`, capped at `max_hp`.
+/// - にほんばれ: lose `max_hp / 8`, floored at 0.
+/// - すなあらし / ゆき / 天候なし: no extra residual (sand chip stays in
+///   `apply_sand_damage_active`).
+///
+/// `max_hp` is the same `effective_hp` denominator as the 1/4 Water absorb
+/// and sand chip. Integer division, no minimum of 1 (same as sand's
+/// `max_hp / 16`). A fainted holder is unchanged. The ability is the
+/// post-mega effective ability, matching sand. Showdown also fires this on
+/// Primordial Sea / Desolate Land and suppresses it with Utility Umbrella;
+/// neither weather nor that item exists in the Champions model. Magic Guard's
+/// "damage only from attacks" cannot stack with Dry Skin on one holder.
+///
+/// Rain and sun are the only weathers that read the team. Every other weather
+/// returns before any HP write, so a side without かんそうはだ is unchanged.
+pub fn apply_dry_skin_weather_active(
+  active : Int,
+  hps : Array[Int],
+  team : Array[Combatant],
+  megaed : Array[Bool],
+  max_hp : Int,
+  weather : @model.Weather,
+) -> Unit {
+  let delta = match weather {
+    @model.Rain => max_hp / 8
+    @model.Sun => -(max_hp / 8)
+    _ => 0
+  }
+  if delta == 0 {
+    return
+  }
+  if hps[active] <= 0 {
+    return
+  }
+  let is_mega = active < megaed.length() && megaed[active]
+  let eff = effective_combatant(team[active], is_mega)
+  if eff.ability != "かんそうはだ" {
+    return
+  }
+  if delta > 0 {
+    add_hp_capped(hps, active, delta, max_hp)
+  } else {
+    sub_hp_floor0(hps, active, -delta)
+  }
+}
+
+///|
 /// Update a switched-out slot's status per mainline switch-out rules:
 /// - `BadPoison(n)`: keep the status but reset the counter to 0 (next tick
 ///   is 1/16 again).
@@ -1400,6 +2046,38 @@ pub fn reset_toxic_counter_on_switch(
     @model.Drowsy(_) => @model.None
     other => other
   }
+}
+
+///|
+/// 再生力 (Regenerator). 交代で場を離れるポケモンが、ひんしでなければ最大 HP の
+/// 1/3（切り捨て）を回復する。回復後も `max_hp` は超えない。出てくる側には
+/// 効かない — 呼び出し側が switched-out slot だけに適用する。
+///
+/// Showdown の `onSwitchOut` + `heal(baseMaxhp / 3)` に合わせる:
+/// - HP <= 0（ひんし）では不発。`heal` が fainted で失敗するのと同じ。
+/// - `max_hp / 3` は正の整数除算で切り捨て。最大 HP が 3 未満なら回復量 0。
+/// - 特性が「再生力」以外なら HP も乱数も触らない no-op。
+///
+/// `max_hp` は payoff の HP プール上限（`pokemon.hp`。初期 HP・terminal ratio・
+/// きあいのタスキの満タン判定と同じ）。メガは HP を変えない。`effective_hp`
+/// （Lv50 実数値）は初期 HP より大きく、満タン交代でも回復して比率が 1 を
+/// 超えるため使わない。DP は mega 後実効特性、MC は mega 未モデルで raw ability。
+pub fn apply_regenerator_on_switch_out(
+  ability : String,
+  hps : Array[Int],
+  slot : Int,
+  max_hp : Int,
+) -> Unit {
+  if ability != "再生力" {
+    return
+  }
+  if slot < 0 || slot >= hps.length() {
+    return
+  }
+  if hps[slot] <= 0 {
+    return
+  }
+  add_hp_capped(hps, slot, max_hp / 3, max_hp)
 }
 
 ///|
@@ -1425,6 +2103,7 @@ pub fn is_burned(s : @model.StatusCondition) -> Bool {
 pub fn sleep_turns(s : @model.StatusCondition) -> Int? {
   match s {
     @model.Sleep(n) => Some(n)
+    @model.RestSleep(n) => Some(n)
     _ => None
   }
 }
@@ -1493,7 +2172,7 @@ pub fn sub_hp_floor0(hps : Array[Int], slot : Int, amount : Int) -> Unit {
 ///
 /// 引数 `attacker_status` / `attacker_ability` は段階 7 (Rest) で追加。
 /// Rest は HP を max まで戻すと同時に `attacker_status[active]` を
-/// `Sleep(2)` に **上書き** する本家挙動を持つため、status fanout
+/// `RestSleep(2)` に **上書き** する本家挙動を持つため、status fanout
 /// (`maybe_apply_status_fanout`) を経由できない (fanout は既存 status が
 /// `None` の場合のみ書き換える保護を持っている)。さらに `ふみん` /
 /// `やるき` / `スイートベール` の Sleep 免疫がある attacker では Rest 自体
@@ -1540,6 +2219,8 @@ pub fn apply_healing(
   defender_ability : String,
   field? : @model.Field = @model.Field::None,
   attacker_grounded? : Bool = true,
+  attacker_type1? : String = "",
+  attacker_type2? : String = "",
 ) -> Unit {
   match mv.healing {
     None => ()
@@ -1586,7 +2267,16 @@ pub fn apply_healing(
       // Magic Guard は Sleep の付与を **阻止しない** (residual damage の
       // immunity であって status immunity ではない) ので、ability_blocks_status
       // の truth table から意図的に外している (ability_immunity.mbt 参照)。
-      if ability_blocks_status(attacker_ability, @model.SleepKind) {
+      // ふみん / やるき / スイートベールに加え、きよめのしお、はれのリーフガードも
+      // ねむれない。フラワーベールは自分への付与 (self_inflicted) を止めない。
+      if ability_blocks_status(
+        attacker_ability,
+        @model.SleepKind,
+        weather~,
+        type1=attacker_type1,
+        type2=attacker_type2,
+        self_inflicted=true,
+      ) {
         return
       }
       // エレキフィールド / ミストフィールド 下で grounded な使用者は眠れない
@@ -1605,14 +2295,15 @@ pub fn apply_healing(
       if attacker_hps[attacker_active_slot] >= attacker_max {
         return
       }
-      // 既存 status を強制的に Sleep(2) で上書き (本家挙動 — Burn / Poison /
-      // Para / 既存 Sleep(残ターン) を Rest が必ず書き換える)。
+      // 既存 status を強制的に RestSleep(2) で上書き (本家挙動 — Burn / Poison /
+      // Para / 既存 Sleep(残ターン) を Rest が必ず書き換える)。Rest 由来は
+      // 2 回目の目覚め抽選を持たない `RestSleep` (3 ターン目まで確定で眠る)。
       // status fanout を経由せず直接書き込むのは、fanout が None 保護を
       // 持っているため (Rest はその保護を bypass する必要がある)。
       // HP も max まで強制リセット (`add_hp_capped` の早期 return を bypass
       // する必要があるため直接代入)。
       attacker_hps[attacker_active_slot] = attacker_max
-      attacker_status[attacker_active_slot] = @model.Sleep(2)
+      attacker_status[attacker_active_slot] = @model.RestSleep(2)
     }
     Some(@model.Drain(n, d)) => {
       // Drain は dmg > 0 のときのみ発動。dmg=0 (タイプ免疫 / 0 ダメ) では

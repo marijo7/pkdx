@@ -68,7 +68,9 @@ pub fn check_def_immunity(ability : String, move_type : String) -> Bool {
   match ability {
     "ちょすい" | "よびみず" => move_type == "みず"
     "もらいび" => move_type == "ほのお"
-    "ひらいしん" | "でんきエンジン" => move_type == "でんき"
+    // ちくでん: Champions tokuseiinfo_syn TOKUSEIINFO_SYN_010
+    // "Electric-type moves do not work on the Pokémon. Instead, they restore 1/4 of its max HP."
+    "ひらいしん" | "でんきエンジン" | "ちくでん" => move_type == "でんき"
     "ふゆう" => move_type == "じめん"
     "そうしょく" => move_type == "くさ"
     "かんそうはだ" => move_type == "みず"
@@ -93,6 +95,10 @@ pub fn get_def_type_resist(ability : String, move_type : String) -> Double {
         1.0
       }
     "もふもふ" => if move_type == "ほのお" { 2.0 } else { 1.0 }
+    // かんそうはだのほのお 1.25 は威力段階の一度だけ。
+    // Champions `TOKUSEIINFO_SYN_087` は受けるダメージ 1.25 倍。Showdown は
+    // `onSourceBasePower` の `chainModify(1.25)` (= 威力 ×5120/4096 の切り捨て)。
+    // 最終補正 5120 を重ねると約 1.25^2 になるので、ここだけに置く。
     "かんそうはだ" => if move_type == "ほのお" { 1.25 } else { 1.0 }
     _ => 1.0
   }
@@ -139,8 +145,11 @@ pub fn apply_atk_ability_power(
       } else {
         move_power
       }
+    // Showdown reckless: `move.recoil || move.hasCrashDamage` で chainModify
+    // ([4915, 4096]) (≒ 1.2x)。崩れ技 (is_crash_move) も対象。てっていこうせん は
+    // Showdown では mindBlownRecoil のみで対象外 (is_max_hp_recoil_move 側)。
     "すてみ" =>
-      if is_recoil_move(move_name) {
+      if is_recoil_move(move_name) || is_crash_move(move_name) {
         move_power * 12 / 10
       } else {
         move_power
@@ -162,6 +171,7 @@ pub fn apply_atk_ability_power(
       } else {
         move_power
       }
+    // CLI は特性名だけで 3/2。payoff は未発動のとき能力名を外してから呼ぶ。
     "もらいび" =>
       if move_type == "ほのお" {
         move_power * 3 / 2
@@ -210,11 +220,58 @@ pub fn get_stab_mult(ability : String) -> Int {
 }
 
 ///|
+/// ちからずく が威力を上げる「追加効果」がこの技にあるか。
+///
+/// Champions `tokuseiinfo_syn.json` `TOKUSEIINFO_SYN_125` (usa 行 4170):
+/// "The Pokémon’s moves lose their additional effects, but the power of
+/// those moves will be boosted by 30%." 日本語 (jpn 行 4064):
+/// 「攻撃の追加効果はなくなるが１．３倍の威力で技を出すことができる。」
+/// 英語の "those moves" に合わせ、追加効果を失う技だけを真にする。
+///
+/// 落とす集合は payoff `secondary_gated_move` / MC の
+/// `ability_strips_secondaries` と同じで、`clear_damaging_secondaries` が
+/// 消すフィールドに限る: ダメージ技 (`power > 0`) の `status_effect`
+/// (chance > 0) と `flinch_chance > 0`。変化技の状態異常は直接効果なので
+/// 対象外。`stat_effects` (能力変化)・反動・ドレインは現行の除去対象に
+/// 入っていないので、ここでも追加効果に数えない。
+pub fn move_has_sheer_force_effect(mv : @model.Move) -> Bool {
+  if mv.power <= 0 {
+    return false
+  }
+  if mv.flinch_chance > 0 {
+    return true
+  }
+  match mv.status_effect {
+    Some((_, chance)) => chance > 0
+    None => false
+  }
+}
+
+///|
+/// ちからずく の 1.3 倍がこの技に乗るか。`move_has_sheer_force_effect` と
+/// 特性名の積。ダメージキャッシュのキーとダメージ式は両方これを見る。
+pub fn sheer_force_boost_applies(ability : String, mv : @model.Move) -> Bool {
+  ability == "ちからずく" && move_has_sheer_force_effect(mv)
+}
+
+///|
+/// ダメージ技の追加効果 (`status_effect` と `flinch_chance`) を落とした写し。
+/// ちからずく が剥がす集合と、HP が減らなかった命中で付かない集合は同じ。
+/// `stat_effects` は触らない。変化技では呼ばない (状態異常は直接効果)。
+pub fn clear_damaging_secondaries(mv : @model.Move) -> @model.Move {
+  { ..mv, status_effect: None, flinch_chance: 0 }
+}
+
+///|
 /// Get attacker ability final modifier (4096 base). Returns 0 if not applicable.
+///
+/// `sheer_force_effect` は ちからずく 専用。真のときだけ 5325/4096 (1.3 倍)。
+/// アナライズ はこのフラグを見ない (従来どおり常に 5325)。
 pub fn get_atk_ability_final(
   ability : String,
   move_type : String,
   fainted_count : Int,
+  sheer_force_effect? : Bool = false,
 ) -> Int {
   match ability {
     "トランジスタ" => if move_type == "でんき" { 5325 } else { 0 }
@@ -230,7 +287,8 @@ pub fn get_atk_ability_final(
       } else {
         0
       }
-    "ちからずく" | "アナライズ" => 5325
+    "アナライズ" => 5325
+    "ちからずく" => if sheer_force_effect { 5325 } else { 0 }
     "そうだいしょう" => {
       let count = if fainted_count < 0 {
         0
@@ -269,7 +327,8 @@ pub fn get_def_ability_final(
   }
   match ability {
     "マルチスケイル" => 2048
-    "フィルター" | "ハードロック" =>
+    // プリズムアーマーはかたやぶりで無視されないため、かたやぶり実装時はフィルター/ハードロックと分岐を分けること。
+    "フィルター" | "ハードロック" | "プリズムアーマー" =>
       if is_super_effective {
         3072
       } else {
@@ -282,7 +341,8 @@ pub fn get_def_ability_final(
       } else {
         0
       }
-    "かんそうはだ" => if move_type == "ほのお" { 5120 } else { 0 }
+    // かんそうはだのほのおは `get_def_type_resist` の威力 1.25 だけ。
+    // ここに 5120 を足すと最終ダメージにもう一度 1.25 が掛かる。
     _ => 0
   }
 }

@@ -31,6 +31,9 @@ fn best_expected_damage(
   atk_protean_locked? : String = "",
   def_protean_locked? : String = "",
   def_disguise_intact? : Bool = false,
+  atk_hp? : Int = 0,
+  atk_max_hp? : Int = 0,
+  atk_flash_fire? : Bool = false,
 ) -> Double {
   // Stage 7 (Protean / Libero MC parity): override attacker / defender combatant
   // 経由で Protean ロックを適用する。MC は mega を未モデルなので is_mega=false
@@ -61,7 +64,14 @@ fn best_expected_damage(
     // priority>0 の damage 期待値を 0 として評価する。これが無いと greedy が
     // 無効化される priority 技を選び続け、resolution 側で `mc_psychic_priority_
     // blocked` により毎ターン no-effect になって MC value が DP と乖離する。
-    if mc_psychic_priority_blocked(mv, field, dfn) {
+    if mc_psychic_priority_blocked(
+        mv,
+        field,
+        dfn,
+        attacker_ability=atk.ability,
+        attacker_hp=atk_hp,
+        attacker_max_hp=atk_max_hp,
+      ) {
       continue
     }
     let ar = match mv.category {
@@ -74,9 +84,10 @@ fn best_expected_damage(
       @model.Special => def_ranks[3]
       @model.Status => 0
     }
+    let atk_for_calc = attacker_for_flash_fire(atk_eff, mv, weather, atk_flash_fire)
     let r = @damage.calc_damage(
       build_input_with_ranks(
-        atk_eff,
+        atk_for_calc,
         dfn_eff,
         mv,
         ar,
@@ -153,6 +164,7 @@ fn greedy_team_action(
   my_protean_locked? : Array[String] = [],
   opp_protean_locked? : Array[String] = [],
   opp_disguise_busted? : Array[Bool] = [],
+  my_flash_fire? : Array[Bool] = [],
 ) -> TeamAction? {
   // Stage 7 (Protean / Libero MC parity): per-slot ロックを greedy 評価に
   // 渡すための helper。slot が範囲外 / 配列未指定 (テスト用 default [] ) のとき
@@ -170,7 +182,10 @@ fn greedy_team_action(
   // 扱いだが、ability != "ばけのかわ" なら disguise_intact_mc が false を返すため
   // 非 disguise チームでは no-op。
   let opp_def_intact = disguise_intact_mc(
-    opp_team, opp_active, opp_disguise_busted,
+    opp_team,
+    opp_active,
+    opp_disguise_busted,
+    attacker_ability=my_team[active].ability,
   )
   if must_recharge && my_hps[active] > 0 {
     return Some(TmUseMove(0))
@@ -201,6 +216,9 @@ fn greedy_team_action(
         atk_protean_locked=locked_of(my_protean_locked, s),
         def_protean_locked=opp_locked,
         def_disguise_intact=opp_def_intact,
+        atk_hp=my_hps[s],
+        atk_max_hp=my_team[s].pokemon.hp,
+        atk_flash_fire=flash_fire_lit(my_flash_fire, s),
       )
       if score > best_score {
         best_score = score
@@ -265,6 +283,9 @@ fn greedy_team_action(
       atk_protean_locked=active_locked,
       def_protean_locked=opp_locked,
       def_disguise_intact=opp_def_intact,
+      atk_hp=my_hps[active],
+      atk_max_hp=my_team[active].pokemon.hp,
+      atk_flash_fire=flash_fire_lit(my_flash_fire, active),
     ) /
     opp_hp_denom
   let mut best_switch = -1
@@ -284,6 +305,9 @@ fn greedy_team_action(
         atk_protean_locked=locked_of(my_protean_locked, s),
         def_protean_locked=opp_locked,
         def_disguise_intact=opp_def_intact,
+        atk_hp=my_hps[s],
+        atk_max_hp=my_team[s].pokemon.hp,
+        atk_flash_fire=flash_fire_lit(my_flash_fire, s),
       ) /
       opp_hp_denom
     if v > best_switch_value {
@@ -308,6 +332,9 @@ fn greedy_team_action(
       atk_protean_locked=active_locked,
       def_protean_locked=opp_locked,
       def_disguise_intact=opp_def_intact,
+      atk_hp=my_hps[active],
+      atk_max_hp=my_team[active].pokemon.hp,
+      atk_flash_fire=flash_fire_lit(my_flash_fire, active),
     ) {
     Some(i) => Some(TmUseMove(i))
     None => Some(TmUseMove(0))
@@ -344,7 +371,7 @@ fn greedy_team_action(
 /// (1-element 配列で mutable に渡す)。Wish 使用で `[0]` に 2 を書き、EOT で
 /// `tick_and_fire_wish_inplace` が active slot へ向けて発動する。DP 側
 /// (`SwitchingGameState.my_wish_turns : Int`) と同じ slot-bound 仕様。
-/// `attacker_status` は Rest が `Sleep(2)` を上書きするために必要。
+/// `attacker_status` は Rest が `RestSleep(2)` を上書きするために必要。
 /// `defender_megaed` は LeechSeed くさ判定の mega 後 type 解決に渡す
 /// (MC では常に false 固定の dummy 配列だが、シグネチャは DP 側
 /// `effective_combatant` 経路と整合)。MC は attacker mega を解決しないため
@@ -354,6 +381,10 @@ fn greedy_team_action(
 /// `applied for both damaging and status moves` — `team_perform_attack` は
 /// status moves で damage を返さないが、本関数の全 phase (stat_effects 〜
 /// weather_set) は damage の有無に依存せず適用される。
+///
+/// `immune=true` (タイプ / 特性で無効な leg) は吸収と同じく早期 return し、自爆
+/// (`self_ko`) だけを適用する。DP `with_immune_effects` と同じ判定 (Protean の記録と
+/// しろいハーブ判定は call site が行う)。
 fn team_apply_post_hit(
   attacker_hps : Array[Int],
   attacker_active : Int,
@@ -374,12 +405,77 @@ fn team_apply_post_hit(
   field_turns_state : Array[Int],
   mv : @model.Move,
   dmg : Int,
+  immune? : Bool = false,
+  defender_flash_fire? : Array[Bool] = [],
 ) -> Unit {
+  // 吸収 (そうしょく / ちくでん / ちょすい / かんそうはだ / でんきエンジン /
+  // ひらいしん / もらいび): 技は当たらない。防御側のランク上昇と 1/4 回復だけ行い、
+  // 以降の効果 (stat_effects / recoil / 回復 / 寄生 / ねがいごと / self_ko / recharge)
+  // は起きない。崩れは呼び出し側が `res_immune` で先に適用する (ダメージ技は
+  // `check_def_immunity` で immune)。Protean の記録は呼び出し側 (DP と同じ)。
+  let absorb_type = @damage.resolve_effective_move_type(
+    mv,
+    weather_state[0],
+    attacker_team[attacker_active].ability,
+  )
+  let absorb_ability = defender_ability_for_move(
+    attacker_team[attacker_active].ability,
+    defender_team[defender_active].ability,
+  )
+  if ability_absorbs_move(absorb_ability, mv.name, absorb_type) {
+    // A fainted holder gains no boost (see `with_absorb_effects` on the DP side).
+    if defender_hps[defender_active] > 0 {
+      match ability_absorb_boost(absorb_ability) {
+        Some((stat, delta)) =>
+          defender_ranks[stat] = clamp_rank_for(
+            absorb_ability,
+            defender_ranks[stat] + delta,
+          )
+        None => ()
+      }
+      if absorb_ability == "もらいび" &&
+        defender_active >= 0 &&
+        defender_active < defender_flash_fire.length() {
+        defender_flash_fire[defender_active] = true
+      }
+      let max_hp = effective_hp(defender_team[defender_active])
+      defender_hps[defender_active] = absorb_healed_hp(
+        absorb_ability,
+        defender_hps[defender_active],
+        max_hp,
+      )
+    }
+    return
+  }
+  // タイプ / 特性で無効 (`team_perform_attack` の immune): 技は当たらず
+  // spreadMoveHit に届かない。自己ダウン / 反動 / 回復 / 自己 recharge / 天候・フィールド
+  // 設定は起きない。例外は selfdestruct: 'always' (じばく系 = self_ko) で、対象判定より前に
+  // 使用者が ひんし になる (Showdown battle-actions.ts:564-566)。DP `with_immune_effects` と同じ。
+  if immune {
+    if mv.self_ko {
+      attacker_hps[attacker_active] = 0
+    }
+    // 免疫 (MoveFail) でも てっていこうせん は最大 HP の 1/2 を失う (対象生存時のみ)。
+    team_apply_max_hp_recoil(
+      attacker_hps,
+      attacker_active,
+      attacker_team,
+      mv,
+      defender_hps[defender_active] > 0,
+    )
+    return
+  }
   let opp_alive = defender_hps[defender_active] > 0
   // raw ability で足りる: あまのじゃく を持つ mega form は存在しないため raw =
   // mega 後実効と常に一致し、drain 経路の defender_ability raw 慣例とも整合する。
   let attacker_ability = attacker_team[attacker_active].ability
-  let defender_ability = defender_team[defender_active].ability
+  let defender_ability = defender_ability_for_move(
+    attacker_ability,
+    defender_team[defender_active].ability,
+  )
+  // MC は mega 未モデルなので raw のタイプ。フラワーベール以外は
+  // ability_blocks_opp_stat_drop が type を読まない。
+  let defender_mon = defender_team[defender_active].pokemon
   apply_stat_effects(
     attacker_ranks,
     defender_ranks,
@@ -387,6 +483,8 @@ fn team_apply_post_hit(
     mv,
     attacker_ability~,
     defender_ability~,
+    defender_type1=defender_mon.type1,
+    defender_type2=defender_mon.type2,
   )
   if mv.recoil_num > 0 && dmg > 0 {
     let raw = dmg * mv.recoil_num / mv.recoil_den
@@ -394,6 +492,8 @@ fn team_apply_post_hit(
     let new_hp = attacker_hps[attacker_active] - recoil
     attacker_hps[attacker_active] = if new_hp < 0 { 0 } else { new_hp }
   }
+  // てっていこうせん の最大 HP 反動 (命中は実ダメージ > 0 のときだけ発動)。
+  team_apply_max_hp_recoil(attacker_hps, attacker_active, attacker_team, mv, dmg > 0)
   // Stage 13: 回復技 (HealingEffect) を self_ko の **手前** で適用。じばく系 +
   // healing の組合せは現状ゲーム内には無いが、ある場合は self_ko 側 (HP=0 強制
   // 上書き) が後勝ち、という DP 側の順序契約を MC でも維持する。
@@ -422,6 +522,8 @@ fn team_apply_post_hit(
     defender_ability,
     field=field_state[0],
     attacker_grounded~,
+    attacker_type1=attacker_c.pokemon.type1,
+    attacker_type2=attacker_c.pokemon.type2,
   )
   // Stage 13: LeechSeed 植え付け (apply_healing は attacker 側バッファしか
   // 触れない設計なので、defender_leech_seeded への書き込みは専用パス)。
@@ -541,11 +643,16 @@ fn disguise_intact_mc(
   defender_team : Array[Combatant],
   defender_slot : Int,
   busted : Array[Bool],
+  attacker_ability? : String = "",
 ) -> Bool {
   if defender_slot < 0 || defender_slot >= defender_team.length() {
     return false
   }
-  if defender_team[defender_slot].ability != "ばけのかわ" {
+  let ability = defender_ability_for_move(
+    attacker_ability,
+    defender_team[defender_slot].ability,
+  )
+  if ability != "ばけのかわ" {
     return false
   }
   if defender_slot < busted.length() && busted[defender_slot] {
@@ -584,7 +691,10 @@ fn most_likely_variant(r : @model.DamageCalcResult) -> @model.DamageVariant? {
 /// `perform_attack_with` in `monte_carlo.mbt` but free-standing so the team
 /// rollout stays self-contained.
 ///
-/// 戻り値 `(new_hp, dmg_for_effects, disguise_busted)`:
+/// 戻り値 `(new_hp, dmg_for_effects, disguise_busted, immune)`:
+///   - `immune`: 技がタイプ / 特性で無効 (`calc_damage` の `is_immune`)。caller は
+///     `team_apply_post_hit` に渡し、自己効果を止める (DP の hits_count=0 leg と同じ)。
+///     崩れ技の使用者はこの leg で崩れ HP を失う (`mc_apply_crash`)。status (power<=0) は false。
 ///   - `new_hp`: 解決後の防御側 HP (0 床クランプ)。
 ///   - `dmg_for_effects`: recoil / drain 計算に使う「技が実際に HP へ与えたダメージ」。
 ///     非 ばけのかわ 時は実 dealt (= defender_hp - new_hp) で従来の
@@ -612,13 +722,14 @@ fn team_perform_attack(
   atk_protean_locked? : String = "",
   def_protean_locked? : String = "",
   def_disguise_intact? : Bool = false,
-) -> (Int, Int, Bool) {
+  atk_flash_fire? : Bool = false,
+) -> (Int, Int, Bool, Bool) {
   if mv.power <= 0 {
     // Status moves: no damage and no in-place stat mutation. The caller
     // applies `stat_effects` (with opp_alive gating) via
     // `team_apply_post_hit` so both branches share one resolver. ばけのかわ は
     // 変化技では剥がれず chip も無い (dmg_for_effects=0, busted=false)。
-    return (defender_hp, 0, false)
+    return (defender_hp, 0, false, false)
   }
   let atk_rank = match mv.category {
     @model.Physical => atk_ranks[0]
@@ -646,9 +757,12 @@ fn team_perform_attack(
     protean_locked=def_protean_locked,
   )
   let atk_consumed = atk_protean_locked != ""
+  let atk_for_calc = attacker_for_flash_fire(
+    attacker_eff, mv, weather, atk_flash_fire,
+  )
   let r = @damage.calc_damage(
     build_input_with_ranks(
-      attacker_eff,
+      atk_for_calc,
       defender_eff,
       mv,
       atk_rank,
@@ -659,9 +773,10 @@ fn team_perform_attack(
     ),
   )
   if r.is_immune {
-    // タイプ無効: ばけのかわ は剥がれず chip も無い (DP `compute_damage_variants`
-    // の immune 早期 return と一致)。
-    return (defender_hp, 0, false)
+    // タイプ / 特性で無効: ばけのかわ は剥がれず chip も無い (DP `compute_damage_variants`
+    // の immune 早期 return と一致)。自己効果は caller の `team_apply_post_hit`
+    // (immune=true) が止める。
+    return (defender_hp, 0, false, true)
   }
   // burn 半減: 従来の単一ロール挙動 (物理 → raw/2) を helper 化。ばけのかわ の
   // chip は特性由来の固定ダメージなので burn 半減しない (later-hits 分にのみ掛ける)。
@@ -704,7 +819,7 @@ fn team_perform_attack(
     } else {
       0
     }
-    return (new_hp, dmg_for_effects, true)
+    return (new_hp, dmg_for_effects, true, false)
   }
   // 非 ばけのかわ: 従来どおり (単一ロール、burn 半減、0 床クランプ)。rng 消費は
   // intact 分岐と同じ 1 回 (`idx`) なので、非 disguise チームの決定性は bit-exact。
@@ -712,7 +827,7 @@ fn team_perform_attack(
   // (= actual dealt = min(dmg, defender_hp)) を dmg_for_effects として返す。
   let dmg = burn_halve(raw)
   let new_hp = if defender_hp - dmg < 0 { 0 } else { defender_hp - dmg }
-  (new_hp, defender_hp - new_hp, false)
+  (new_hp, defender_hp - new_hp, false, false)
 }
 
 ///|
@@ -729,35 +844,263 @@ fn rand_bool(rng : @random.Rand, p : Double) -> Bool {
 }
 
 ///|
+/// Accuracy fed to the MC attempt roll. A move the defender absorbs, a
+/// damaging move the defender's ability or typing nullifies, or a status move
+/// `status_move_fails_on_foe` rejects, is not subject to the roll, so its
+/// accuracy is 100. `defender_protean` is the defender's Protean lock (MC has
+/// no mega; the lock is not cleared here). Mirrors `attempt_accuracy` on the
+/// DP side for the non-mega case. The lock is the one from the start of the
+/// turn: a faster Protean that changes the defender before this move does not
+/// rebuild the roll.
+fn mc_attempt_accuracy(
+  attacker : Combatant,
+  mv : @model.Move,
+  defender : Combatant,
+  weather : @model.Weather,
+  defender_protean? : String = "",
+) -> Int {
+  let atk_eff = effective_combatant(attacker, false)
+  let def_eff0 = effective_combatant(
+    defender, false, protean_locked=defender_protean,
+  )
+  let def_eff = defender_for_mold_breaker(atk_eff, def_eff0)
+  let move_type = @damage.resolve_effective_move_type(
+    mv,
+    weather,
+    atk_eff.ability,
+  )
+  if ability_absorbs_move(def_eff.ability, mv.name, move_type) ||
+    damaging_move_immune(
+      def_eff.ability,
+      mv.name,
+      move_type,
+      mv.power,
+      def_eff.pokemon.type1,
+      def_eff.pokemon.type2,
+    ) ||
+    status_move_fails_on_foe(atk_eff, mv, def_eff, weather) {
+    100
+  } else {
+    mv.accuracy
+  }
+}
+
+///|
 /// Resolve a single attack attempt for `me` in the MC rollout, respecting
 /// paralysis (12.5% failure), sleep (skip + counter decrement / wake-up),
-/// and move accuracy. Returns the new status of `me` and whether the action
-/// executes this turn.
+/// and move accuracy. Returns the new status of `me`, whether the action
+/// executes this turn, and `missed` = the move was used and missed (accuracy
+/// miss). Sleep / paralysis / recharge skips are never `missed` (only a
+/// missed move reaches Showdown's `MoveFail`, the crash of 崩れ技). Mirrors
+/// `SideAttempt.miss` on the DP side.
 fn mc_resolve_attempt(
   status : @model.StatusCondition,
   mv_acc : Int,
   rng : @random.Rand,
-) -> (@model.StatusCondition, Bool) {
+  thaws_user? : Bool = false,
+) -> (@model.StatusCondition, Bool, Bool) {
   match status {
-    @model.Sleep(n) => {
-      if n > 0 {
-        return (@model.Sleep(n - 1), false)
+    @model.Freeze(n) => {
+      // 解凍技 (defrost) は使用者を行動前に解凍する (乱数なし)。外れても解凍は起きる。
+      if thaws_user {
+        let acts = rand_bool(rng, mv_acc.to_double() / 100.0)
+        return (@model.None, acts, !acts)
       }
-      // Sleep(0): wake up and act subject to accuracy below.
+      // 凍結: 1 / 2 回目 (Freeze(n >= 1)) は 25% で解凍して行動、75% で凍ったまま。
+      // 3 回目 (Freeze(0)) は確定解凍。解凍して行動する枝は命中判定する (DP `per_side_attempt`)。
+      if n >= 1 && !rand_bool(rng, FREEZE_THAW_RATE) {
+        return (@model.Freeze(n - 1), false, false)
+      }
       let acts = rand_bool(rng, mv_acc.to_double() / 100.0)
-      (@model.None, acts)
+      (@model.None, acts, !acts)
+    }
+    @model.Sleep(n) => {
+      if n >= 2 {
+        return (@model.Sleep(n - 1), false, false)
+      }
+      if n == 1 {
+        // 2 回目: 1/3 で目覚めて行動 (命中判定あり)、2/3 で眠ったまま。
+        if !rand_bool(rng, SLEEP_SECOND_TURN_WAKE_RATE) {
+          return (@model.Sleep(0), false, false)
+        }
+      }
+      // Sleep(0) (3 回目) と 2 回目の目覚め: 命中判定して行動。命中外れは
+      // 技を使ったうえでの外れ (`missed = true`、崩れ技の判定に使う)。
+      let acts = rand_bool(rng, mv_acc.to_double() / 100.0)
+      (@model.None, acts, !acts)
+    }
+    @model.RestSleep(n) => {
+      if n > 0 {
+        return (@model.RestSleep(n - 1), false, false)
+      }
+      // RestSleep(0): 3 回目。確定で目覚めて行動 (命中判定あり)。
+      let acts = rand_bool(rng, mv_acc.to_double() / 100.0)
+      (@model.None, acts, !acts)
     }
     @model.Paralyze => {
       if rand_bool(rng, PARALYZE_SKIP_RATE) {
-        return (@model.Paralyze, false)
+        return (@model.Paralyze, false, false)
       }
       let acts = rand_bool(rng, mv_acc.to_double() / 100.0)
-      (@model.Paralyze, acts)
+      (@model.Paralyze, acts, !acts)
     }
     other => {
       let acts = rand_bool(rng, mv_acc.to_double() / 100.0)
-      (other, acts)
+      (other, acts, !acts)
     }
+  }
+}
+
+///|
+/// MC の こおり 補助: 行動者の解凍技 (defrost) 判定。もえつきる は炎タイプ使用者のみ。
+fn mc_move_thaws_user(c : Combatant, mv : @model.Move) -> Bool {
+  if !@damage.is_defrost_user_move(mv.name) {
+    return false
+  }
+  mv.name != "もえつきる" || c.pokemon.type1 == "ほのお" || c.pokemon.type2 == "ほのお"
+}
+
+///|
+/// MC の こおり 補助: 行動時点へ解凍抽選を遅らせる側 (DP `freeze_roll_deferred` と同じ規則)。
+/// 両者が技を出すことは呼び出し側で保証する。
+fn mc_freeze_deferred(
+  status : @model.StatusCondition,
+  recharging : Bool,
+  thaws_user : Bool,
+  opp_freezes : Bool,
+) -> Bool {
+  if recharging || thaws_user {
+    return false
+  }
+  match status {
+    @model.Freeze(_) => true
+    @model.None => opp_freezes
+    _ => false
+  }
+}
+
+///|
+/// MC のひるみ: 相手の技がひるみを付与しうるとき、行動時点へ試行を遅らせる側 (DP
+/// `flinch_roll_deferred` と同じ規則)。両者が技を出すことは呼び出し側で保証する。
+/// リチャージ中の側は行動しないので遅らせない。
+fn mc_flinch_deferred(recharging : Bool, opp_flinch_chance : Int) -> Bool {
+  !recharging && opp_flinch_chance > 0
+}
+
+///|
+/// MC のひるみ抽選 (DP `maybe_apply_flinch_fanout` の 1 命中版)。先攻の技が命中して相手が生存し、
+/// この命中で相手の HP が減り (ばけのかわ の chip を含む)、ちからずく でなく、相手の特性で遮断
+/// されないときに `flinch_chance` % で成立する。多段技の命中数ぶんの抽選は持たず 1 回として扱う
+/// (現データのひるみ技は全て単発。DP は `hits_count` 回の独立抽選)。
+fn mc_flinch_roll(
+  rng : @random.Rand,
+  mv : @model.Move,
+  attacker_ability : String,
+  defender : Combatant,
+  hp_before : Int,
+  hp_after : Int,
+  immune : Bool,
+  user_fresh? : Bool? = None,
+) -> Bool {
+  let chance = flinch_chance_if_fresh(mv, user_fresh)
+  if immune || mv.power <= 0 || chance <= 0 {
+    return false
+  }
+  if hp_after <= 0 || hp_before - hp_after <= 0 {
+    return false
+  }
+  if ability_strips_secondaries(attacker_ability) {
+    return false
+  }
+  if flinch_blocked_by_ability(
+    defender_ability_for_move(attacker_ability, defender.ability),
+    mv,
+  ) {
+    return false
+  }
+  rand_bool(rng, flinch_probability(chance, 1))
+}
+
+///|
+/// MC の保留試行 (こおり / ひるみ) を行動時点で解決する。`flinched` が true ならひるみの分布
+/// (`flinched_outcomes`、DP と同じ SSoT) から 1 つ引く。行動しない (命中判定なし)。戻り値は
+/// (新しい状態, 行動するか, 外れたか, ふくつのこころ が発火したか)。`flinched = false` は従来どおり。
+fn mc_resolve_pending_attempt(
+  rng : @random.Rand,
+  status : @model.StatusCondition,
+  mv_acc : Int,
+  thaws_user : Bool,
+  flinched : Bool,
+) -> (@model.StatusCondition, Bool, Bool, Bool) {
+  if !flinched {
+    let (st, acts, missed) = mc_resolve_attempt(
+      status,
+      mv_acc,
+      rng,
+      thaws_user=thaws_user,
+    )
+    return (st, acts, missed, false)
+  }
+  let outs = flinched_outcomes(status, thaws_user)
+  let u = rng.int(limit=1000000).to_double() / 1000000.0
+  let mut cum = 0.0
+  for i = 0; i < outs.length(); i = i + 1 {
+    let (p, post, steadfast) = outs[i]
+    cum = cum + p
+    if u < cum {
+      return (post, false, false, steadfast)
+    }
+  }
+  let (_, post, steadfast) = outs[outs.length() - 1]
+  (post, false, false, steadfast)
+}
+
+///|
+/// ふくつのこころ (MC): ひるみで行動を止められた側の素早さランクを +1 する (DP
+/// `ws_with_flinch_speed_boost` と同じ `clamp_rank_for`)。MC は mega を模さないので生の特性を読む。
+fn mc_flinch_speed_boost(ranks : Array[Int], ability : String) -> Unit {
+  if ability_flinch_speed_boost(ability) {
+    ranks[4] = clamp_rank_for(ability, ranks[4] + 1)
+  }
+}
+
+///|
+/// 解凍 (こおり → None)。こおり以外は変えない。
+fn mc_thaw(defender_status : Array[@model.StatusCondition], slot : Int) -> Unit {
+  match defender_status[slot] {
+    @model.Freeze(_) => defender_status[slot] = @model.None
+    _ => ()
+  }
+}
+
+///|
+/// 炎タイプの攻撃技が実ダメージを与えたら凍った相手を解凍 (DP `apply_damage_variants_fanout`
+/// の Fire 解凍と同じ条件。`dealt` は immune / Disguise 破壊の chip を除いた実ダメージ > 0)。
+fn mc_thaw_on_fire_hit(
+  defender_status : Array[@model.StatusCondition],
+  slot : Int,
+  mv : @model.Move,
+  weather : @model.Weather,
+  atk_ability : String,
+  dealt : Bool,
+) -> Unit {
+  if dealt &&
+    mv.category != @model.Status &&
+    @damage.resolve_effective_move_type(mv, weather, atk_ability) == "ほのお" {
+    mc_thaw(defender_status, slot)
+  }
+}
+
+///|
+/// thawsTarget 技 (Scald 等) は命中後、二次効果の後に相手を解凍する (DP の順序と同じ)。
+fn mc_thaw_target_after_secondary(
+  defender_status : Array[@model.StatusCondition],
+  slot : Int,
+  mv : @model.Move,
+  dealt : Bool,
+) -> Unit {
+  if dealt && @damage.is_thaws_target_move(mv.name) {
+    mc_thaw(defender_status, slot)
   }
 }
 
@@ -783,7 +1126,38 @@ fn mc_try_apply_status(
   defender_status_arr : Array[@model.StatusCondition],
   defender_slot : Int,
   field? : @model.Field = @model.Field::None,
+  immune? : Bool = false,
+  weather? : @model.Weather = @model.Weather::None,
+  // 攻撃側の事情と命中結果 (DP `secondary_gated_move` と同じ規則): `hp_lost` は この命中で
+  // 相手の HP が減った量 (ばけのかわ の吸収 chip を含む。0 なら追加効果は付かない)、
+  // `attacker_ability` は攻撃側の特性 (ちからずく)。既定値 (1 / "") は従来どおり付く。
+  hp_lost? : Int = 1,
+  attacker_ability? : String = "",
+  // 変化技の受け手 Protean。"" のときは素のタイプ (ダメージ技の追加効果は見ない)。
+  defender_protean? : String = "",
 ) -> Unit {
+  // タイプ / 特性で無効な leg は技が当たらないので状態異常も付与しない (DP の
+  // `apply_damage_variants_fanout` は immune leg で fanout を回さない)。
+  if immune {
+    return
+  }
+  // 追加効果 (power > 0) は、相手の HP を減らした命中で、攻撃側がちからずく でなければ付く。
+  if mv.power > 0 && (hp_lost <= 0 || ability_strips_secondaries(attacker_ability)) {
+    return
+  }
+  // 吸収された状態技は状態異常を付与しない (DP `with_absorb_effects` と同じ判定)。
+  // Weather は type 解決に効かない (Weather Ball は草タイプにならない)。
+  if defender_slot < defender_team.length() &&
+    ability_absorbs_move(
+      defender_ability_for_move(
+        attacker_ability,
+        defender_team[defender_slot].ability,
+      ),
+      mv.name,
+      @damage.resolve_effective_move_type(mv, @model.Weather::None, ""),
+    ) {
+    return
+  }
   let eff = match mv.status_effect {
     None => return
     Some(x) => x
@@ -799,7 +1173,36 @@ fn mc_try_apply_status(
     return
   }
   let c = defender_team[defender_slot]
-  if @model.immune_to_status(kind, c.pokemon.type1, c.pokemon.type2) {
+  // 変化技は Protean 後のタイプと特性。ダメージ技の追加効果は素のまま。
+  let (imm_t1, imm_t2, imm_ab) = if mv.power <= 0 {
+    let eff = effective_combatant(c, false, protean_locked=defender_protean)
+    (eff.pokemon.type1, eff.pokemon.type2, eff.ability)
+  } else {
+    (c.pokemon.type1, c.pokemon.type2, c.ability)
+  }
+  if @model.immune_to_status(kind, imm_t1, imm_t2) {
+    return
+  }
+  // 特性の状態異常免疫。DP `status_blocked_by_holder_ability` と同じ
+  // `ability_blocks_status`。MC は mega を模さないので raw combatant
+  // (変化技だけ Protean でタイプを上書きした eff)。
+  if ability_blocks_status(
+    defender_ability_for_move(attacker_ability, imm_ab),
+    kind,
+    weather~,
+    type1=imm_t1,
+    type2=imm_t2,
+  ) {
+    return
+  }
+  // りんぷん: ダメージ技の追加効果を全 kind で止める。こおり だけ はれ / マグマのよろい も止める
+  // (DP `secondary_blocked_by_holder` と同じ規則)。MC は mega を模さないので raw combatant の特性。
+  let seen_ability = defender_ability_for_move(attacker_ability, c.ability)
+  if mv.power > 0 && ability_blocks_secondary(seen_ability) {
+    return
+  }
+  if kind == @model.FreezeKind &&
+    (weather == @model.Weather::Sun || ability_blocks_freeze(seen_ability)) {
     return
   }
   // Stage H: terrain (Misty / Electric) は grounded defender への状態異常付与を
@@ -810,7 +1213,7 @@ fn mc_try_apply_status(
     if @damage.is_grounded(
         type1=c.pokemon.type1,
         type2=c.pokemon.type2,
-        ability=c.ability,
+        ability=defender_ability_for_move(attacker_ability, c.ability),
         item=c.item,
       ) {
       return
@@ -824,9 +1227,9 @@ fn mc_try_apply_status(
 
 ///|
 /// MC variant of the DP Psychic-terrain priority block (switching_game_turn.mbt
-/// Stage G-3). Returns `true` when `mv` has priority > 0 and the grounded
-/// `defender` is under Psychic Terrain — the attack is fully negated (no
-/// damage / post-hit / status), matching the DP single-leaf no-effect branch.
+/// Stage G-3). Returns `true` when the move's effective priority is > 0 and the
+/// grounded `defender` is under Psychic Terrain — the attack is fully negated
+/// (no damage / post-hit / status), matching the DP single-leaf no-effect branch.
 /// MC does not model mega, so the raw combatant is read directly (= DP's
 /// `effective_combatant(defender, false)`). Without this gate the MC screening
 /// phase overvalues priority moves under Psychic Terrain vs the DP refine phase.
@@ -834,8 +1237,12 @@ fn mc_psychic_priority_blocked(
   mv : @model.Move,
   field : @model.Field,
   defender : Combatant,
+  attacker_ability? : String = "",
+  attacker_hp? : Int = 0,
+  attacker_max_hp? : Int = 0,
 ) -> Bool {
-  if mv.priority <= 0 {
+  // 省略時は補正 0。既存の base priority>0 テストはそのまま。
+  if effective_priority(attacker_ability, mv, attacker_hp, attacker_max_hp) <= 0 {
     return false
   }
   match field {
@@ -843,11 +1250,108 @@ fn mc_psychic_priority_blocked(
       @damage.is_grounded(
         type1=defender.pokemon.type1,
         type2=defender.pokemon.type2,
-        ability=defender.ability,
+        ability=defender_ability_for_move(attacker_ability, defender.ability),
         item=defender.item,
       )
     _ => false
   }
+}
+
+///|
+/// 技解決前の失敗。はやてがえし (相手の実効優先度)、サイコフィールド、
+/// いたずらごころのあく無効。ねこだまし / であいがしらは別 (fresh ゲート)。
+fn mc_attack_negated(
+  mv : @model.Move,
+  foe_mv : @model.Move?,
+  attacker : Combatant,
+  attacker_hp : Int,
+  defender : Combatant,
+  defender_hp : Int,
+  field : @model.Field,
+  defender_protean : String,
+) -> Bool {
+  if upper_hand_fails(
+      mv,
+      foe_mv,
+      foe_ability=defender.ability,
+      foe_hp=defender_hp,
+      foe_max_hp=defender.pokemon.hp,
+    ) {
+    return true
+  }
+  if mc_psychic_priority_blocked(
+      mv,
+      field,
+      defender,
+      attacker_ability=attacker.ability,
+      attacker_hp=attacker_hp,
+      attacker_max_hp=attacker.pokemon.hp,
+    ) {
+    return true
+  }
+  // 吸収は TryHit がいたずらごころより前。ここで true を返すと回復・上昇が消える。
+  let move_type = @damage.resolve_effective_move_type(
+    mv,
+    @model.Weather::None,
+    attacker.ability,
+  )
+  if ability_absorbs_move(
+    defender_ability_for_move(attacker.ability, defender.ability),
+    mv.name,
+    move_type,
+  ) {
+    return false
+  }
+  prankster_status_blocked(
+    attacker,
+    false,
+    mv,
+    defender,
+    false,
+    defender_protean,
+  )
+}
+
+///|
+/// 変化技が受け手に効かない。true のとき呼び出し側は Protean だけ残して
+/// ダメージ・状態・ランクを付けない。はやてがえしとサイコフィールドは
+/// PrepareHit より前に技自体が失敗するので false
+/// (呼び出し側は `mc_attack_negated` に任せる)。
+fn mc_status_fail_before_hit(
+  mv : @model.Move,
+  foe_mv : @model.Move?,
+  attacker : Combatant,
+  attacker_hp : Int,
+  defender : Combatant,
+  defender_hp : Int,
+  field : @model.Field,
+  weather : @model.Weather,
+  defender_protean : String,
+) -> Bool {
+  if upper_hand_fails(
+    mv,
+    foe_mv,
+    foe_ability=defender.ability,
+    foe_hp=defender_hp,
+    foe_max_hp=defender.pokemon.hp,
+  ) {
+    return false
+  }
+  if mc_psychic_priority_blocked(
+    mv,
+    field,
+    defender,
+    attacker_ability=attacker.ability,
+    attacker_hp~,
+    attacker_max_hp=attacker.pokemon.hp,
+  ) {
+    return false
+  }
+  let atk = effective_combatant(attacker, false)
+  let def0 = effective_combatant(
+    defender, false, protean_locked=defender_protean,
+  )
+  status_move_fails_on_foe(atk, mv, defender_for_mold_breaker(atk, def0), weather)
 }
 
 // Stage 13: `mc_eot_slip` は削除。MC rollout の EOT 状態異常 slip は DP 側
@@ -856,31 +1360,24 @@ fn mc_psychic_priority_blocked(
 // pre-Stage-13 と完全一致 (関数本体が同じ).
 
 ///|
-/// Stage 7 (Protean / Libero MC parity): 攻撃が解決した直後に attacker スロットへ
-/// Protean ロックを記録する。DP 側 `with_post_hit_effects` の記録条件と semantics
-/// 一致:
-///   - 実効特性が へんげんじざい / リベロ (MC は mega 未モデルなので raw ability)
-///   - tera_type == "" (テラス中は型固定で Protean 非発動)
-///   - 当該 slot が未ロック ("") — once per switch-in
-/// 記録値は `mv.type_`。status 技でもカテゴリゲートなしで発動する。
+/// Stage 7 (Protean / Libero MC parity): 攻撃を出そうとした時点で attacker
+/// スロットへ Protean ロックを記録する。DP 側 `protean_lock_type` と同じ条件
+/// (解決後タイプ、単タイプ一致では消費しない、テラスタル中は非発動)。命中・
+/// 無効・吸収に加え、命中外れでも呼ぶ (Showdown `PrepareHit` は Accuracy より前)。
+/// MC は mega 未モデルなので raw ability。
 fn record_protean_lock(
   locked : Array[String],
   active : Int,
   attacker : Combatant,
   mv : @model.Move,
+  weather : @model.Weather,
 ) -> Unit {
-  if active < 0 || active >= locked.length() {
+  if active < 0 || active >= locked.length() || locked[active] != "" {
     return
   }
-  if locked[active] != "" {
-    return
-  }
-  if attacker.tera_type != "" {
-    return
-  }
-  if attacker.ability == "へんげんじざい" ||
-    attacker.ability == "リベロ" {
-    locked[active] = mv.type_
+  let t = protean_lock_type(attacker, mv, weather)
+  if t != "" {
+    locked[active] = t
   }
 }
 
@@ -902,6 +1399,8 @@ pub fn team_rollout(
   epsilon? : Double = default_rollout_epsilon,
   weather? : @model.Weather = @model.Weather::None,
   field? : @model.Field = @model.Field::None,
+  my_fresh? : Bool? = None,
+  opp_fresh? : Bool? = None,
 ) -> Double {
   let own_hps = Array::make(own.length(), 0)
   let opp_hps = Array::make(opp.length(), 0)
@@ -971,8 +1470,18 @@ pub fn team_rollout(
   // switch-in)。MC は mega 未モデルなので mega リセットは無い。
   let own_protean_locked : Array[String] = Array::make(own.length(), "")
   let opp_protean_locked : Array[String] = Array::make(opp.length(), "")
+  // もらいび状態。炎技を吸収した slot だけ true。交代で出ていく slot は false。
+  let own_flash_fire : Array[Bool] = Array::make(own.length(), false)
+  let opp_flash_fire : Array[Bool] = Array::make(opp.length(), false)
+  // しろいハーブ (held_item_stat_reset.mbt) の消費フラグ。DP の my/opp_item_consumed と
+  // 同じ slot-bound・戦闘持続 semantics (交代で回復しない)。Switch arm ではリセットしない。
+  let own_item_consumed : Array[Bool] = Array::make(own.length(), false)
+  let opp_item_consumed : Array[Bool] = Array::make(opp.length(), false)
   let mut own_active = 0
   let mut opp_active = 0
+  // ねこだまし。None は未追跡 (select の既定)。Some は交代で true、技の行動で false。
+  let mut own_fresh : Bool? = my_fresh
+  let mut opp_fresh : Bool? = opp_fresh
   // 登場時いかく: 先発 lead 同士 (双方 slot 0)。DP 側 switching_game_winrate_stats
   // の初期 lead 配線 (apply_intimidate_entry x2) と同 semantics。MC は mega
   // 未モデル (megaed 常 false) なので raw の combatant.ability で判定する
@@ -982,12 +1491,21 @@ pub fn team_rollout(
     opp[opp_active].ability,
     opp_ranks,
     own_ranks,
+    target_type1=opp[opp_active].pokemon.type1,
+    target_type2=opp[opp_active].pokemon.type2,
   )
   apply_intimidate_on_entry(
     opp[opp_active].ability,
     own[own_active].ability,
     own_ranks,
     opp_ranks,
+    target_type1=own[own_active].pokemon.type1,
+    target_type2=own[own_active].pokemon.type2,
+  )
+  // しろいハーブ: 先発の登場時いかく直後に両 lead を判定する (DP の lead 配線と同じ位置)。
+  apply_held_item_stat_reset_pair(
+    own, own_active, own_hps, own_ranks, own_item_consumed,
+    opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
   )
   for _ in 0..<turn_limit {
     let a_own = greedy_team_action(
@@ -1006,6 +1524,7 @@ pub fn team_rollout(
       my_protean_locked=own_protean_locked,
       opp_protean_locked~,
       opp_disguise_busted~,
+      my_flash_fire=own_flash_fire,
     )
     let a_opp = greedy_team_action(
       opp_active,
@@ -1023,6 +1542,7 @@ pub fn team_rollout(
       my_protean_locked=opp_protean_locked,
       opp_protean_locked=own_protean_locked,
       opp_disguise_busted=own_disguise_busted,
+      my_flash_fire=opp_flash_fire,
     )
     match (a_own, a_opp) {
       (None, _) => return -1.0
@@ -1045,23 +1565,111 @@ pub fn team_rollout(
         let opp_start_active = opp_active
         let own_start_recharging = own_must_recharge[own_start_active]
         let opp_start_recharging = opp_must_recharge[opp_start_active]
+        // ねこだまし / であいがしら の判定はターン開始時の値を見る。更新はターン末 (Step 4 の前)。
+        let own_fresh_at_turn = own_fresh
+        let opp_fresh_at_turn = opp_fresh
         // Step 1: resolve status-phase attempts for move attempts (switches are
         // always successful and bypass sleep / paralyze). Recharge short-
         // circuits UseMove to `acts=false` regardless of status.
         let mut own_attempt_acts = true
         let mut opp_attempt_acts = true
+        let mut own_missed = false
+        let mut opp_missed = false
+        // ひるみ (追加効果) のターン内フラグ。先攻の技の命中で後攻側に立つ (DP の `*_flinched` と同じ)。
+        let mut own_flinch = false
+        let mut opp_flinch = false
+        // こおり: 両者が技を出し、こちらが凍っている / 相手の技が凍らせうるとき、解凍抽選と命中を
+        // 行動時点 (Step 3) で振る (DP `freeze_roll_deferred` と同じ規則)。ここでは仮の値を置く。
+        let own_thaws = match ao {
+          TmUseMove(mi) => mc_move_thaws_user(own[own_active], own[own_active].moves[mi])
+          _ => false
+        }
+        let opp_thaws = match ap {
+          TmUseMove(mi) => mc_move_thaws_user(opp[opp_active], opp[opp_active].moves[mi])
+          _ => false
+        }
+        let own_pending_on = match (ao, ap) {
+          (TmUseMove(mi), TmUseMove(mj)) =>
+            mc_freeze_deferred(
+              own_status[own_active],
+              own_start_recharging,
+              own_thaws,
+              move_can_freeze(opp[opp_active].moves[mj]),
+            ) ||
+            mc_flinch_deferred(
+              own_start_recharging,
+              flinch_chance_vs_choice(
+                opp[opp_active].moves[mj],
+                opp_fresh_at_turn,
+                Some(own[own_active].moves[mi]),
+                foe_ability=own[own_active].ability,
+                foe_hp=own_hps[own_active],
+                foe_max_hp=own[own_active].pokemon.hp,
+              ),
+            )
+          _ => false
+        }
+        let opp_pending_on = match (ao, ap) {
+          (TmUseMove(mi), TmUseMove(mj)) =>
+            mc_freeze_deferred(
+              opp_status[opp_active],
+              opp_start_recharging,
+              opp_thaws,
+              move_can_freeze(own[own_active].moves[mi]),
+            ) ||
+            mc_flinch_deferred(
+              opp_start_recharging,
+              flinch_chance_vs_choice(
+                own[own_active].moves[mi],
+                own_fresh_at_turn,
+                Some(opp[opp_active].moves[mj]),
+                foe_ability=opp[opp_active].ability,
+                foe_hp=opp_hps[opp_active],
+                foe_max_hp=opp[opp_active].pokemon.hp,
+              ),
+            )
+          _ => false
+        }
+        let mut own_pending_acc = 100
+        let mut opp_pending_acc = 100
+        // Switches resolve before moves. Accuracy and immunity see the
+        // Pokémon that will be hit, not the one that is switching out.
+        let opp_acc_slot = match ap {
+          TmSwitch(j) => j
+          _ => opp_active
+        }
+        let own_acc_slot = match ao {
+          TmSwitch(i) => i
+          _ => own_active
+        }
         match ao {
           TmUseMove(mi) =>
             if own_start_recharging {
               own_attempt_acts = false
+            } else if own_pending_on {
+              own_pending_acc = mc_attempt_accuracy(
+                own[own_active],
+                own[own_active].moves[mi],
+                opp[opp_acc_slot],
+                weather_state[0],
+                defender_protean=opp_protean_locked[opp_acc_slot],
+              )
             } else {
-              let (st, acts) = mc_resolve_attempt(
+              let (st, acts, missed) = mc_resolve_attempt(
                 own_status[own_active],
-                own[own_active].moves[mi].accuracy,
+                mc_attempt_accuracy(
+                  own[own_active],
+                  own[own_active].moves[mi],
+                  opp[opp_acc_slot],
+                  weather_state[0],
+                  defender_protean=opp_protean_locked[opp_acc_slot],
+                ),
                 rng,
+                thaws_user=own_thaws,
               )
               own_status[own_active] = st
               own_attempt_acts = acts
+              own_missed = missed
             }
           _ => ()
         }
@@ -1069,14 +1677,30 @@ pub fn team_rollout(
           TmUseMove(mi) =>
             if opp_start_recharging {
               opp_attempt_acts = false
+            } else if opp_pending_on {
+              opp_pending_acc = mc_attempt_accuracy(
+                opp[opp_active],
+                opp[opp_active].moves[mi],
+                own[own_acc_slot],
+                weather_state[0],
+                defender_protean=own_protean_locked[own_acc_slot],
+              )
             } else {
-              let (st, acts) = mc_resolve_attempt(
+              let (st, acts, missed) = mc_resolve_attempt(
                 opp_status[opp_active],
-                opp[opp_active].moves[mi].accuracy,
+                mc_attempt_accuracy(
+                  opp[opp_active],
+                  opp[opp_active].moves[mi],
+                  own[own_acc_slot],
+                  weather_state[0],
+                  defender_protean=own_protean_locked[own_acc_slot],
+                ),
                 rng,
+                thaws_user=opp_thaws,
               )
               opp_status[opp_active] = st
               opp_attempt_acts = acts
+              opp_missed = missed
             }
           _ => ()
         }
@@ -1088,6 +1712,15 @@ pub fn team_rollout(
         // Pokemon、DP 側 SwitchingGame の Switch arm と同じ semantics)。
         match ao {
           TmSwitch(i) => {
+            // 再生力: 出ていく slot。DP の Switch arm と同じく active 更新前。
+            // MC は mega 未モデルなので raw ability + pokemon.hp（megaed=false
+            // の DP と一致）。ひんしの死に出しは helper が HP<=0 で不発にする。
+            apply_regenerator_on_switch_out(
+              own[own_active].ability,
+              own_hps,
+              own_active,
+              own[own_active].pokemon.hp,
+            )
             own_status[own_active] = reset_toxic_counter_on_switch(
               own_status[own_active],
             )
@@ -1100,6 +1733,7 @@ pub fn team_rollout(
             if own_active < own_protean_locked.length() {
               own_protean_locked[own_active] = ""
             }
+            clear_flash_fire_slot(own_flash_fire, own_active)
             own_active = i
             reset_ranks(own_ranks)
           }
@@ -1107,6 +1741,12 @@ pub fn team_rollout(
         }
         match ap {
           TmSwitch(i) => {
+            apply_regenerator_on_switch_out(
+              opp[opp_active].ability,
+              opp_hps,
+              opp_active,
+              opp[opp_active].pokemon.hp,
+            )
             opp_status[opp_active] = reset_toxic_counter_on_switch(
               opp_status[opp_active],
             )
@@ -1116,6 +1756,7 @@ pub fn team_rollout(
             if opp_active < opp_protean_locked.length() {
               opp_protean_locked[opp_active] = ""
             }
+            clear_flash_fire_slot(opp_flash_fire, opp_active)
             opp_active = i
             reset_ranks(opp_ranks)
           }
@@ -1136,6 +1777,8 @@ pub fn team_rollout(
             opp[opp_active].ability,
             opp_ranks,
             own_ranks,
+            target_type1=opp[opp_active].pokemon.type1,
+            target_type2=opp[opp_active].pokemon.type2,
           )
         }
         if opp_switches {
@@ -1144,8 +1787,16 @@ pub fn team_rollout(
             own[own_active].ability,
             own_ranks,
             opp_ranks,
+            target_type1=own[own_active].pokemon.type1,
+            target_type2=own[own_active].pokemon.type2,
           )
         }
+        // しろいハーブ: 登場時いかく (双方の switch 解決後) の直後に両 active を判定する。
+        // 技 (Step 3) より前なので、いかく で下がったランクはこのターンの技に効く前に解除される。
+        apply_held_item_stat_reset_pair(
+          own, own_active, own_hps, own_ranks, own_item_consumed,
+          opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
+        )
         // Step 3: resolve moves honouring paralysis speed halving and skips.
         if !own_switches && !opp_switches {
           let mi_own = match ao {
@@ -1178,10 +1829,20 @@ pub fn team_rollout(
           }
           let s = turn_order_sign(
             own[own_active],
-            mv_own.priority,
+            effective_priority(
+              own[own_active].ability,
+              mv_own,
+              own_hps[own_active],
+              own[own_active].pokemon.hp,
+            ),
             eff_spe_own,
             opp[opp_active],
-            mv_opp.priority,
+            effective_priority(
+              opp[opp_active].ability,
+              mv_opp,
+              opp_hps[opp_active],
+              opp[opp_active].pokemon.hp,
+            ),
             eff_spe_opp,
           )
           let own_first = if s > 0 {
@@ -1197,22 +1858,67 @@ pub fn team_rollout(
           let own_pre_status = own_status[own_active]
           let opp_pre_status = opp_status[opp_active]
           if own_first {
+            // こおり / ひるみ: 先攻 (own) の遅らせた試行は行動時点 (ここ) で振る。先攻はひるまない。
+            if own_pending_on {
+              let (st, acts, missed, _) = mc_resolve_pending_attempt(
+                rng,
+                own_status[own_active],
+                own_pending_acc,
+                own_thaws,
+                own_flinch,
+              )
+              own_status[own_active] = st
+              own_attempt_acts = acts
+              own_missed = missed
+            }
             let mut opp_blocked_mid_turn = false
             // Stage H: Psychic Terrain priority block — own の priority>0 技は
             // grounded な opp に対し無効化 (DP resolve 側 Stage G-3 と一致)。
+            // 無効な変化技は命中分岐を作らず、Protean だけ残して効果を付けない。
             if own_attempt_acts &&
-              !mc_psychic_priority_blocked(
+              !fake_out_fails(mv_own, own_fresh_at_turn) &&
+              !first_impression_fails(mv_own, own_fresh_at_turn) &&
+              mc_status_fail_before_hit(
                 mv_own,
-                field_state[0],
+                Some(mv_opp),
+                own[own_active],
+                own_hps[own_active],
                 opp[opp_active],
+                opp_hps[opp_active],
+                field_state[0],
+                weather_state[0],
+                opp_protean_locked[opp_active],
+              ) {
+              record_protean_lock(
+                own_protean_locked,
+                own_active,
+                own[own_active],
+                mv_own,
+                weather_state[0],
+              )
+            } else if own_attempt_acts &&
+              !fake_out_fails(mv_own, own_fresh_at_turn) &&
+              !first_impression_fails(mv_own, own_fresh_at_turn) &&
+              !mc_attack_negated(
+                mv_own,
+                Some(mv_opp),
+                own[own_active],
+                own_hps[own_active],
+                opp[opp_active],
+                opp_hps[opp_active],
+                field_state[0],
+                opp_protean_locked[opp_active],
               ) {
               let before = opp_hps[opp_active]
               let opp_intact = disguise_intact_mc(
-                opp, opp_active, opp_disguise_busted,
+                opp,
+                opp_active,
+                opp_disguise_busted,
+                attacker_ability=own[own_active].ability,
               )
-              let (res_hp, res_eff, res_bust) = team_perform_attack(
-                own[own_active],
-                opp[opp_active],
+              let (res_hp, res_eff, res_bust, res_immune) = team_perform_attack(
+                consumed_item_view(own, own_active, own_item_consumed),
+                consumed_item_view(opp, opp_active, opp_item_consumed),
                 before,
                 mv_own,
                 rng,
@@ -1224,22 +1930,33 @@ pub fn team_rollout(
                 atk_protean_locked=own_protean_locked[own_active],
                 def_protean_locked=opp_protean_locked[opp_active],
                 def_disguise_intact=opp_intact,
+                atk_flash_fire=flash_fire_lit(own_flash_fire, own_active),
               )
               opp_hps[opp_active] = res_hp
+              mc_thaw_on_fire_hit(opp_status, opp_active, mv_own, weather_state[0], own[own_active].ability, !res_immune && !res_bust && res_hp < before)
               if res_bust && opp_active < opp_disguise_busted.length() {
                 opp_disguise_busted[opp_active] = true
+              }
+              if res_immune {
+                mc_apply_crash(own_hps, own_active, own[own_active], mv_own)
               }
               team_apply_post_hit(
                 own_hps, own_active, own_ranks, own_must_recharge, own_status, own_wish_turns,
                 own, opp_hps, opp_active, opp_ranks, opp_leech_seeded, opp, opp_megaed,
                 weather_state, weather_turns_state, field_state, field_turns_state,
-                mv_own, res_eff,
+                mv_own, res_eff, immune=res_immune,
+                defender_flash_fire=opp_flash_fire,
+              )
+              apply_held_item_stat_reset_pair(
+                own, own_active, own_hps, own_ranks, own_item_consumed,
+                opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
               )
               record_protean_lock(
                 own_protean_locked,
                 own_active,
                 own[own_active],
                 mv_own,
+                weather_state[0],
               )
               mc_try_apply_status(
                 rng,
@@ -1249,39 +1966,131 @@ pub fn team_rollout(
                 opp_status,
                 opp_active,
                 field=field_state[0],
+                immune=res_immune,
+                weather=weather_state[0],
+                hp_lost=before - res_hp,
+                attacker_ability=own[own_active].ability,
+                defender_protean=opp_protean_locked[opp_active],
               )
+              mc_thaw_target_after_secondary(opp_status, opp_active, mv_own, !res_immune && !res_bust && res_hp < before)
               if all_ko(own_hps) {
                 return -1.0
               }
               if all_ko(opp_hps) {
                 return 1.0
               }
+              // ひるみ: 先攻 (own) の命中で後攻 (opp) にひるみ抽選 (DP `maybe_apply_flinch_fanout`)。
+              if mc_flinch_roll(
+                rng,
+                mv_own,
+                own[own_active].ability,
+                opp[opp_active],
+                before,
+                res_hp,
+                res_immune,
+                user_fresh=own_fresh_at_turn,
+              ) {
+                opp_flinch = true
+              }
               if action_blocked_by_fresh_status(
                   opp_pre_status,
                   opp_status[opp_active],
                 ) {
                 opp_blocked_mid_turn = true
+                // 着弾ターンが眠りの 1 回目の試行 (DP `transition_with_cache` と同じ)。
+                opp_status[opp_active] = consume_sleep_attempt_on_block(
+                  opp_status[opp_active],
+                )
               }
+            }
+            if own_missed && own_hps[own_active] > 0 {
+              record_protean_lock(
+                own_protean_locked,
+                own_active,
+                own[own_active],
+                mv_own,
+                weather_state[0],
+              )
+              mc_apply_miss_self_loss(
+                own_hps,
+                own_active,
+                own,
+                mv_own,
+                opp_hps[opp_active] > 0,
+              )
+              if all_ko(own_hps) {
+                return -1.0
+              }
+            }
+            // こおり: 後攻 (opp) の遅らせた試行は先攻の技の結果を見てから振る。
+            if opp_pending_on && opp_hps[opp_active] > 0 && own_hps[own_active] > 0 {
+              let (st, acts, missed, steadfast) = mc_resolve_pending_attempt(
+                rng,
+                opp_status[opp_active],
+                opp_pending_acc,
+                opp_thaws,
+                opp_flinch,
+              )
+              if steadfast {
+                mc_flinch_speed_boost(opp_ranks, opp[opp_active].ability)
+              }
+              opp_status[opp_active] = st
+              opp_attempt_acts = acts
+              opp_missed = missed
             }
             if opp_hps[opp_active] > 0 &&
               own_hps[own_active] > 0 &&
               opp_attempt_acts &&
               !opp_blocked_mid_turn &&
-              !mc_psychic_priority_blocked(
+              !fake_out_fails(mv_opp, opp_fresh_at_turn) &&
+              !first_impression_fails(mv_opp, opp_fresh_at_turn) &&
+              mc_status_fail_before_hit(
                 mv_opp,
-                field_state[0],
+                Some(mv_own),
+                opp[opp_active],
+                opp_hps[opp_active],
                 own[own_active],
+                own_hps[own_active],
+                field_state[0],
+                weather_state[0],
+                own_protean_locked[own_active],
+              ) {
+              record_protean_lock(
+                opp_protean_locked,
+                opp_active,
+                opp[opp_active],
+                mv_opp,
+                weather_state[0],
+              )
+            } else if opp_hps[opp_active] > 0 &&
+              own_hps[own_active] > 0 &&
+              opp_attempt_acts &&
+              !opp_blocked_mid_turn &&
+              !fake_out_fails(mv_opp, opp_fresh_at_turn) &&
+              !first_impression_fails(mv_opp, opp_fresh_at_turn) &&
+              !mc_attack_negated(
+                mv_opp,
+                Some(mv_own),
+                opp[opp_active],
+                opp_hps[opp_active],
+                own[own_active],
+                own_hps[own_active],
+                field_state[0],
+                own_protean_locked[own_active],
               ) {
               // Read burn *after* first leg's status fan-out so a fresh burn
               // from own's move halves opp's physical damage this turn.
               let opp_burn_now = is_burned(opp_status[opp_active])
               let before = own_hps[own_active]
               let own_intact = disguise_intact_mc(
-                own, own_active, own_disguise_busted,
+                own,
+                own_active,
+                own_disguise_busted,
+                attacker_ability=opp[opp_active].ability,
               )
-              let (res_hp, res_eff, res_bust) = team_perform_attack(
-                opp[opp_active],
-                own[own_active],
+              let (res_hp, res_eff, res_bust, res_immune) = team_perform_attack(
+                consumed_item_view(opp, opp_active, opp_item_consumed),
+                consumed_item_view(own, own_active, own_item_consumed),
                 before,
                 mv_opp,
                 rng,
@@ -1293,22 +2102,33 @@ pub fn team_rollout(
                 atk_protean_locked=opp_protean_locked[opp_active],
                 def_protean_locked=own_protean_locked[own_active],
                 def_disguise_intact=own_intact,
+                atk_flash_fire=flash_fire_lit(opp_flash_fire, opp_active),
               )
               own_hps[own_active] = res_hp
+              mc_thaw_on_fire_hit(own_status, own_active, mv_opp, weather_state[0], opp[opp_active].ability, !res_immune && !res_bust && res_hp < before)
               if res_bust && own_active < own_disguise_busted.length() {
                 own_disguise_busted[own_active] = true
+              }
+              if res_immune {
+                mc_apply_crash(opp_hps, opp_active, opp[opp_active], mv_opp)
               }
               team_apply_post_hit(
                 opp_hps, opp_active, opp_ranks, opp_must_recharge, opp_status, opp_wish_turns,
                 opp, own_hps, own_active, own_ranks, own_leech_seeded, own, own_megaed,
                 weather_state, weather_turns_state, field_state, field_turns_state,
-                mv_opp, res_eff,
+                mv_opp, res_eff, immune=res_immune,
+                defender_flash_fire=own_flash_fire,
+              )
+              apply_held_item_stat_reset_pair(
+                own, own_active, own_hps, own_ranks, own_item_consumed,
+                opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
               )
               record_protean_lock(
                 opp_protean_locked,
                 opp_active,
                 opp[opp_active],
                 mv_opp,
+                weather_state[0],
               )
               mc_try_apply_status(
                 rng,
@@ -1318,7 +2138,13 @@ pub fn team_rollout(
                 own_status,
                 own_active,
                 field=field_state[0],
+                immune=res_immune,
+                weather=weather_state[0],
+                hp_lost=before - res_hp,
+                attacker_ability=opp[opp_active].ability,
+                defender_protean=own_protean_locked[own_active],
               )
+              mc_thaw_target_after_secondary(own_status, own_active, mv_opp, !res_immune && !res_bust && res_hp < before)
               if all_ko(own_hps) {
                 return -1.0
               }
@@ -1326,23 +2152,86 @@ pub fn team_rollout(
                 return 1.0
               }
             }
+            if opp_missed && opp_hps[opp_active] > 0 && !opp_blocked_mid_turn {
+              record_protean_lock(
+                opp_protean_locked,
+                opp_active,
+                opp[opp_active],
+                mv_opp,
+                weather_state[0],
+              )
+              mc_apply_miss_self_loss(
+                opp_hps,
+                opp_active,
+                opp,
+                mv_opp,
+                own_hps[own_active] > 0,
+              )
+              if all_ko(opp_hps) {
+                return 1.0
+              }
+            }
           } else {
+            // こおり / ひるみ: 先攻 (opp) の遅らせた試行は行動時点 (ここ) で振る。先攻はひるまない。
+            if opp_pending_on {
+              let (st, acts, missed, _) = mc_resolve_pending_attempt(
+                rng,
+                opp_status[opp_active],
+                opp_pending_acc,
+                opp_thaws,
+                opp_flinch,
+              )
+              opp_status[opp_active] = st
+              opp_attempt_acts = acts
+              opp_missed = missed
+            }
             let mut own_blocked_mid_turn = false
             // Stage H: Psychic Terrain priority block — opp の priority>0 技は
             // grounded な own に対し無効化 (DP resolve 側 Stage G-3 と一致)。
             if opp_attempt_acts &&
-              !mc_psychic_priority_blocked(
+              !fake_out_fails(mv_opp, opp_fresh_at_turn) &&
+              !first_impression_fails(mv_opp, opp_fresh_at_turn) &&
+              mc_status_fail_before_hit(
                 mv_opp,
-                field_state[0],
+                Some(mv_own),
+                opp[opp_active],
+                opp_hps[opp_active],
                 own[own_active],
+                own_hps[own_active],
+                field_state[0],
+                weather_state[0],
+                own_protean_locked[own_active],
+              ) {
+              record_protean_lock(
+                opp_protean_locked,
+                opp_active,
+                opp[opp_active],
+                mv_opp,
+                weather_state[0],
+              )
+            } else if opp_attempt_acts &&
+              !fake_out_fails(mv_opp, opp_fresh_at_turn) &&
+              !first_impression_fails(mv_opp, opp_fresh_at_turn) &&
+              !mc_attack_negated(
+                mv_opp,
+                Some(mv_own),
+                opp[opp_active],
+                opp_hps[opp_active],
+                own[own_active],
+                own_hps[own_active],
+                field_state[0],
+                own_protean_locked[own_active],
               ) {
               let before = own_hps[own_active]
               let own_intact = disguise_intact_mc(
-                own, own_active, own_disguise_busted,
+                own,
+                own_active,
+                own_disguise_busted,
+                attacker_ability=opp[opp_active].ability,
               )
-              let (res_hp, res_eff, res_bust) = team_perform_attack(
-                opp[opp_active],
-                own[own_active],
+              let (res_hp, res_eff, res_bust, res_immune) = team_perform_attack(
+                consumed_item_view(opp, opp_active, opp_item_consumed),
+                consumed_item_view(own, own_active, own_item_consumed),
                 before,
                 mv_opp,
                 rng,
@@ -1354,22 +2243,33 @@ pub fn team_rollout(
                 atk_protean_locked=opp_protean_locked[opp_active],
                 def_protean_locked=own_protean_locked[own_active],
                 def_disguise_intact=own_intact,
+                atk_flash_fire=flash_fire_lit(opp_flash_fire, opp_active),
               )
               own_hps[own_active] = res_hp
+              mc_thaw_on_fire_hit(own_status, own_active, mv_opp, weather_state[0], opp[opp_active].ability, !res_immune && !res_bust && res_hp < before)
               if res_bust && own_active < own_disguise_busted.length() {
                 own_disguise_busted[own_active] = true
+              }
+              if res_immune {
+                mc_apply_crash(opp_hps, opp_active, opp[opp_active], mv_opp)
               }
               team_apply_post_hit(
                 opp_hps, opp_active, opp_ranks, opp_must_recharge, opp_status, opp_wish_turns,
                 opp, own_hps, own_active, own_ranks, own_leech_seeded, own, own_megaed,
                 weather_state, weather_turns_state, field_state, field_turns_state,
-                mv_opp, res_eff,
+                mv_opp, res_eff, immune=res_immune,
+                defender_flash_fire=own_flash_fire,
+              )
+              apply_held_item_stat_reset_pair(
+                own, own_active, own_hps, own_ranks, own_item_consumed,
+                opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
               )
               record_protean_lock(
                 opp_protean_locked,
                 opp_active,
                 opp[opp_active],
                 mv_opp,
+                weather_state[0],
               )
               mc_try_apply_status(
                 rng,
@@ -1379,37 +2279,129 @@ pub fn team_rollout(
                 own_status,
                 own_active,
                 field=field_state[0],
+                immune=res_immune,
+                weather=weather_state[0],
+                hp_lost=before - res_hp,
+                attacker_ability=opp[opp_active].ability,
+                defender_protean=own_protean_locked[own_active],
               )
+              mc_thaw_target_after_secondary(own_status, own_active, mv_opp, !res_immune && !res_bust && res_hp < before)
               if all_ko(own_hps) {
                 return -1.0
               }
               if all_ko(opp_hps) {
                 return 1.0
               }
+              // ひるみ: 先攻 (opp) の命中で後攻 (own) にひるみ抽選 (DP `maybe_apply_flinch_fanout`)。
+              if mc_flinch_roll(
+                rng,
+                mv_opp,
+                opp[opp_active].ability,
+                own[own_active],
+                before,
+                res_hp,
+                res_immune,
+                user_fresh=opp_fresh_at_turn,
+              ) {
+                own_flinch = true
+              }
               if action_blocked_by_fresh_status(
                   own_pre_status,
                   own_status[own_active],
                 ) {
                 own_blocked_mid_turn = true
+                // 着弾ターンが眠りの 1 回目の試行 (DP `transition_with_cache` と同じ)。
+                own_status[own_active] = consume_sleep_attempt_on_block(
+                  own_status[own_active],
+                )
               }
+            }
+            if opp_missed && opp_hps[opp_active] > 0 {
+              record_protean_lock(
+                opp_protean_locked,
+                opp_active,
+                opp[opp_active],
+                mv_opp,
+                weather_state[0],
+              )
+              mc_apply_miss_self_loss(
+                opp_hps,
+                opp_active,
+                opp,
+                mv_opp,
+                own_hps[own_active] > 0,
+              )
+              if all_ko(opp_hps) {
+                return 1.0
+              }
+            }
+            // こおり: 後攻 (own) の遅らせた試行は先攻の技の結果を見てから振る。
+            if own_pending_on && own_hps[own_active] > 0 && opp_hps[opp_active] > 0 {
+              let (st, acts, missed, steadfast) = mc_resolve_pending_attempt(
+                rng,
+                own_status[own_active],
+                own_pending_acc,
+                own_thaws,
+                own_flinch,
+              )
+              if steadfast {
+                mc_flinch_speed_boost(own_ranks, own[own_active].ability)
+              }
+              own_status[own_active] = st
+              own_attempt_acts = acts
+              own_missed = missed
             }
             if own_hps[own_active] > 0 &&
               opp_hps[opp_active] > 0 &&
               own_attempt_acts &&
               !own_blocked_mid_turn &&
-              !mc_psychic_priority_blocked(
+              !fake_out_fails(mv_own, own_fresh_at_turn) &&
+              !first_impression_fails(mv_own, own_fresh_at_turn) &&
+              mc_status_fail_before_hit(
                 mv_own,
-                field_state[0],
+                Some(mv_opp),
+                own[own_active],
+                own_hps[own_active],
                 opp[opp_active],
+                opp_hps[opp_active],
+                field_state[0],
+                weather_state[0],
+                opp_protean_locked[opp_active],
+              ) {
+              record_protean_lock(
+                own_protean_locked,
+                own_active,
+                own[own_active],
+                mv_own,
+                weather_state[0],
+              )
+            } else if own_hps[own_active] > 0 &&
+              opp_hps[opp_active] > 0 &&
+              own_attempt_acts &&
+              !own_blocked_mid_turn &&
+              !fake_out_fails(mv_own, own_fresh_at_turn) &&
+              !first_impression_fails(mv_own, own_fresh_at_turn) &&
+              !mc_attack_negated(
+                mv_own,
+                Some(mv_opp),
+                own[own_active],
+                own_hps[own_active],
+                opp[opp_active],
+                opp_hps[opp_active],
+                field_state[0],
+                opp_protean_locked[opp_active],
               ) {
               let own_burn_now = is_burned(own_status[own_active])
               let before = opp_hps[opp_active]
               let opp_intact = disguise_intact_mc(
-                opp, opp_active, opp_disguise_busted,
+                opp,
+                opp_active,
+                opp_disguise_busted,
+                attacker_ability=own[own_active].ability,
               )
-              let (res_hp, res_eff, res_bust) = team_perform_attack(
-                own[own_active],
-                opp[opp_active],
+              let (res_hp, res_eff, res_bust, res_immune) = team_perform_attack(
+                consumed_item_view(own, own_active, own_item_consumed),
+                consumed_item_view(opp, opp_active, opp_item_consumed),
                 before,
                 mv_own,
                 rng,
@@ -1421,22 +2413,33 @@ pub fn team_rollout(
                 atk_protean_locked=own_protean_locked[own_active],
                 def_protean_locked=opp_protean_locked[opp_active],
                 def_disguise_intact=opp_intact,
+                atk_flash_fire=flash_fire_lit(own_flash_fire, own_active),
               )
               opp_hps[opp_active] = res_hp
+              mc_thaw_on_fire_hit(opp_status, opp_active, mv_own, weather_state[0], own[own_active].ability, !res_immune && !res_bust && res_hp < before)
               if res_bust && opp_active < opp_disguise_busted.length() {
                 opp_disguise_busted[opp_active] = true
+              }
+              if res_immune {
+                mc_apply_crash(own_hps, own_active, own[own_active], mv_own)
               }
               team_apply_post_hit(
                 own_hps, own_active, own_ranks, own_must_recharge, own_status, own_wish_turns,
                 own, opp_hps, opp_active, opp_ranks, opp_leech_seeded, opp, opp_megaed,
                 weather_state, weather_turns_state, field_state, field_turns_state,
-                mv_own, res_eff,
+                mv_own, res_eff, immune=res_immune,
+                defender_flash_fire=opp_flash_fire,
+              )
+              apply_held_item_stat_reset_pair(
+                own, own_active, own_hps, own_ranks, own_item_consumed,
+                opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
               )
               record_protean_lock(
                 own_protean_locked,
                 own_active,
                 own[own_active],
                 mv_own,
+                weather_state[0],
               )
               mc_try_apply_status(
                 rng,
@@ -1446,12 +2449,37 @@ pub fn team_rollout(
                 opp_status,
                 opp_active,
                 field=field_state[0],
+                immune=res_immune,
+                weather=weather_state[0],
+                hp_lost=before - res_hp,
+                attacker_ability=own[own_active].ability,
+                defender_protean=opp_protean_locked[opp_active],
               )
+              mc_thaw_target_after_secondary(opp_status, opp_active, mv_own, !res_immune && !res_bust && res_hp < before)
               if all_ko(own_hps) {
                 return -1.0
               }
               if all_ko(opp_hps) {
                 return 1.0
+              }
+            }
+            if own_missed && own_hps[own_active] > 0 && !own_blocked_mid_turn {
+              record_protean_lock(
+                own_protean_locked,
+                own_active,
+                own[own_active],
+                mv_own,
+                weather_state[0],
+              )
+              mc_apply_miss_self_loss(
+                own_hps,
+                own_active,
+                own,
+                mv_own,
+                opp_hps[opp_active] > 0,
+              )
+              if all_ko(own_hps) {
+                return -1.0
               }
             }
           }
@@ -1463,19 +2491,51 @@ pub fn team_rollout(
           let mv_own = own[own_active].moves[mi_own]
           let own_burn = is_burned(own_status[own_active])
           // Stage H: Psychic Terrain priority block (DP resolve Stage G-3 と一致)。
+          // 相手は交代したので、はやてがえし は先制攻撃を選んでいない。
           if own_attempt_acts &&
-            !mc_psychic_priority_blocked(
+            !fake_out_fails(mv_own, own_fresh_at_turn) &&
+            !first_impression_fails(mv_own, own_fresh_at_turn) &&
+            mc_status_fail_before_hit(
               mv_own,
-              field_state[0],
+              None,
+              own[own_active],
+              own_hps[own_active],
               opp[opp_active],
+              opp_hps[opp_active],
+              field_state[0],
+              weather_state[0],
+              opp_protean_locked[opp_active],
+            ) {
+            record_protean_lock(
+              own_protean_locked,
+              own_active,
+              own[own_active],
+              mv_own,
+              weather_state[0],
+            )
+          } else if own_attempt_acts &&
+            !fake_out_fails(mv_own, own_fresh_at_turn) &&
+            !first_impression_fails(mv_own, own_fresh_at_turn) &&
+            !mc_attack_negated(
+              mv_own,
+              None,
+              own[own_active],
+              own_hps[own_active],
+              opp[opp_active],
+              opp_hps[opp_active],
+              field_state[0],
+              opp_protean_locked[opp_active],
             ) {
             let before = opp_hps[opp_active]
             let opp_intact = disguise_intact_mc(
-              opp, opp_active, opp_disguise_busted,
+              opp,
+              opp_active,
+              opp_disguise_busted,
+              attacker_ability=own[own_active].ability,
             )
-            let (res_hp, res_eff, res_bust) = team_perform_attack(
-              own[own_active],
-              opp[opp_active],
+            let (res_hp, res_eff, res_bust, res_immune) = team_perform_attack(
+              consumed_item_view(own, own_active, own_item_consumed),
+              consumed_item_view(opp, opp_active, opp_item_consumed),
               before,
               mv_own,
               rng,
@@ -1487,22 +2547,33 @@ pub fn team_rollout(
               atk_protean_locked=own_protean_locked[own_active],
               def_protean_locked=opp_protean_locked[opp_active],
               def_disguise_intact=opp_intact,
+              atk_flash_fire=flash_fire_lit(own_flash_fire, own_active),
             )
             opp_hps[opp_active] = res_hp
+            mc_thaw_on_fire_hit(opp_status, opp_active, mv_own, weather_state[0], own[own_active].ability, !res_immune && !res_bust && res_hp < before)
             if res_bust && opp_active < opp_disguise_busted.length() {
               opp_disguise_busted[opp_active] = true
+            }
+            if res_immune {
+              mc_apply_crash(own_hps, own_active, own[own_active], mv_own)
             }
             team_apply_post_hit(
               own_hps, own_active, own_ranks, own_must_recharge, own_status, own_wish_turns,
               own, opp_hps, opp_active, opp_ranks, opp_leech_seeded, opp, opp_megaed,
               weather_state, weather_turns_state, field_state, field_turns_state,
-              mv_own, res_eff,
+              mv_own, res_eff, immune=res_immune,
+              defender_flash_fire=opp_flash_fire,
+            )
+            apply_held_item_stat_reset_pair(
+              own, own_active, own_hps, own_ranks, own_item_consumed,
+              opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
             )
             record_protean_lock(
               own_protean_locked,
               own_active,
               own[own_active],
               mv_own,
+              weather_state[0],
             )
             mc_try_apply_status(
               rng,
@@ -1512,12 +2583,37 @@ pub fn team_rollout(
               opp_status,
               opp_active,
               field=field_state[0],
+              immune=res_immune,
+              weather=weather_state[0],
+              hp_lost=before - res_hp,
+              attacker_ability=own[own_active].ability,
+              defender_protean=opp_protean_locked[opp_active],
             )
+            mc_thaw_target_after_secondary(opp_status, opp_active, mv_own, !res_immune && !res_bust && res_hp < before)
             if all_ko(own_hps) {
               return -1.0
             }
             if all_ko(opp_hps) {
               return 1.0
+            }
+          }
+          if own_missed && own_hps[own_active] > 0 {
+            record_protean_lock(
+              own_protean_locked,
+              own_active,
+              own[own_active],
+              mv_own,
+              weather_state[0],
+            )
+            mc_apply_miss_self_loss(
+              own_hps,
+              own_active,
+              own,
+              mv_own,
+              opp_hps[opp_active] > 0,
+            )
+            if all_ko(own_hps) {
+              return -1.0
             }
           }
         } else if !opp_switches {
@@ -1528,19 +2624,51 @@ pub fn team_rollout(
           let mv_opp = opp[opp_active].moves[mi_opp]
           let opp_burn = is_burned(opp_status[opp_active])
           // Stage H: Psychic Terrain priority block (DP resolve Stage G-3 と一致)。
+          // 相手は交代したので、はやてがえし は先制攻撃を選んでいない。
           if opp_attempt_acts &&
-            !mc_psychic_priority_blocked(
+            !fake_out_fails(mv_opp, opp_fresh_at_turn) &&
+            !first_impression_fails(mv_opp, opp_fresh_at_turn) &&
+            mc_status_fail_before_hit(
               mv_opp,
-              field_state[0],
+              None,
+              opp[opp_active],
+              opp_hps[opp_active],
               own[own_active],
+              own_hps[own_active],
+              field_state[0],
+              weather_state[0],
+              own_protean_locked[own_active],
+            ) {
+            record_protean_lock(
+              opp_protean_locked,
+              opp_active,
+              opp[opp_active],
+              mv_opp,
+              weather_state[0],
+            )
+          } else if opp_attempt_acts &&
+            !fake_out_fails(mv_opp, opp_fresh_at_turn) &&
+            !first_impression_fails(mv_opp, opp_fresh_at_turn) &&
+            !mc_attack_negated(
+              mv_opp,
+              None,
+              opp[opp_active],
+              opp_hps[opp_active],
+              own[own_active],
+              own_hps[own_active],
+              field_state[0],
+              own_protean_locked[own_active],
             ) {
             let before = own_hps[own_active]
             let own_intact = disguise_intact_mc(
-              own, own_active, own_disguise_busted,
+              own,
+              own_active,
+              own_disguise_busted,
+              attacker_ability=opp[opp_active].ability,
             )
-            let (res_hp, res_eff, res_bust) = team_perform_attack(
-              opp[opp_active],
-              own[own_active],
+            let (res_hp, res_eff, res_bust, res_immune) = team_perform_attack(
+              consumed_item_view(opp, opp_active, opp_item_consumed),
+              consumed_item_view(own, own_active, own_item_consumed),
               before,
               mv_opp,
               rng,
@@ -1552,22 +2680,33 @@ pub fn team_rollout(
               atk_protean_locked=opp_protean_locked[opp_active],
               def_protean_locked=own_protean_locked[own_active],
               def_disguise_intact=own_intact,
+              atk_flash_fire=flash_fire_lit(opp_flash_fire, opp_active),
             )
             own_hps[own_active] = res_hp
+            mc_thaw_on_fire_hit(own_status, own_active, mv_opp, weather_state[0], opp[opp_active].ability, !res_immune && !res_bust && res_hp < before)
             if res_bust && own_active < own_disguise_busted.length() {
               own_disguise_busted[own_active] = true
+            }
+            if res_immune {
+              mc_apply_crash(opp_hps, opp_active, opp[opp_active], mv_opp)
             }
             team_apply_post_hit(
               opp_hps, opp_active, opp_ranks, opp_must_recharge, opp_status, opp_wish_turns,
               opp, own_hps, own_active, own_ranks, own_leech_seeded, own, own_megaed,
               weather_state, weather_turns_state, field_state, field_turns_state,
-              mv_opp, res_eff,
+              mv_opp, res_eff, immune=res_immune,
+              defender_flash_fire=own_flash_fire,
+            )
+            apply_held_item_stat_reset_pair(
+              own, own_active, own_hps, own_ranks, own_item_consumed,
+              opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
             )
             record_protean_lock(
               opp_protean_locked,
               opp_active,
               opp[opp_active],
               mv_opp,
+              weather_state[0],
             )
             mc_try_apply_status(
               rng,
@@ -1577,10 +2716,35 @@ pub fn team_rollout(
               own_status,
               own_active,
               field=field_state[0],
+              immune=res_immune,
+              weather=weather_state[0],
+              hp_lost=before - res_hp,
+              attacker_ability=opp[opp_active].ability,
+              defender_protean=own_protean_locked[own_active],
             )
+            mc_thaw_target_after_secondary(own_status, own_active, mv_opp, !res_immune && !res_bust && res_hp < before)
             if all_ko(own_hps) {
               return -1.0
             }
+            if all_ko(opp_hps) {
+              return 1.0
+            }
+          }
+          if opp_missed && opp_hps[opp_active] > 0 {
+            record_protean_lock(
+              opp_protean_locked,
+              opp_active,
+              opp[opp_active],
+              mv_opp,
+              weather_state[0],
+            )
+            mc_apply_miss_self_loss(
+              opp_hps,
+              opp_active,
+              opp,
+              mv_opp,
+              own_hps[own_active] > 0,
+            )
             if all_ko(opp_hps) {
               return 1.0
             }
@@ -1600,10 +2764,14 @@ pub fn team_rollout(
           opp_start_active < opp_must_recharge.length() {
           opp_must_recharge[opp_start_active] = false
         }
+        // 交代した側は次ターンが初行動。技を選んだ側は成否にかかわらず消費する。
+        // None は None のまま (未指定の入力を追跡し始めない)。
+        own_fresh = fresh_after_switch(own_fresh_at_turn, own_switches)
+        opp_fresh = fresh_after_switch(opp_fresh_at_turn, opp_switches)
         // Step 4: end-of-turn — Gen9 公式順序で適用する。DP 側 `apply_eot`
         // (switching_game_effects.mbt) と同じ順序を保つことで、MC と DP の
         // 意味論 parity を保証する。順序:
-        //   1. 天候ダメ (Sand chip)
+        //   1. 天候ダメ (Sand chip、かんそうはだの雨 1/8 / 日照 1/8)
         //   2. アイテム回復 (たべのこし)
         //   3. やどりぎのタネ tick
         //   4. 状態異常 slip
@@ -1627,6 +2795,24 @@ pub fn team_rollout(
           weather_state[0],
         )
         apply_sand_damage_active(
+          opp_active,
+          opp_hps,
+          opp,
+          opp_megaed,
+          opp_max,
+          weather_state[0],
+        )
+        // かんそうはだ: 砂と同じ天候 residual。DP `apply_eot` と同じ関数。
+        // 雨と日照以外、特性が違う側は HP を書かない。
+        apply_dry_skin_weather_active(
+          own_active,
+          own_hps,
+          own,
+          own_megaed,
+          own_max,
+          weather_state[0],
+        )
+        apply_dry_skin_weather_active(
           opp_active,
           opp_hps,
           opp,
@@ -1721,20 +2907,31 @@ pub fn team_rollout(
         }
 
         // === Step 4.4: 状態異常 slip ===
-        // DP 側 `eot_slip_active` を直接呼ぶ (MC ローカル `mc_eot_slip` と
-        // semantics 完全一致だが、SSoT 化のため DP 側を共有)。Stage 12 で確立
-        // した eot_slip_active を MC でも reuse することで両者の乖離を防ぐ。
+        // DP 側 `eot_slip_active` を直接呼ぶ。分母も DP と同じ
+        // `status_slip_max_hp` (バトルの HP プール)。`own_max` / `opp_max`
+        // (`effective_hp`) を渡すとプールより大きい chip になり、瀕死の閾値で
+        // DP の平均ダメージと MC の 1 乱数が割れる。
+        let own_c = own[own_active]
         let (new_own_hp, new_own_st) = eot_slip_active(
           own_hps[own_active],
-          own_max,
+          status_slip_max_hp(own_c),
           own_status[own_active],
+          ability=own_c.ability,
+          weather=weather_state[0],
+          type1=own_c.pokemon.type1,
+          type2=own_c.pokemon.type2,
         )
         own_hps[own_active] = new_own_hp
         own_status[own_active] = new_own_st
+        let opp_c = opp[opp_active]
         let (new_opp_hp, new_opp_st) = eot_slip_active(
           opp_hps[opp_active],
-          opp_max,
+          status_slip_max_hp(opp_c),
           opp_status[opp_active],
+          ability=opp_c.ability,
+          weather=weather_state[0],
+          type1=opp_c.pokemon.type1,
+          type2=opp_c.pokemon.type2,
         )
         opp_hps[opp_active] = new_opp_hp
         opp_status[opp_active] = new_opp_st
@@ -1777,6 +2974,12 @@ pub fn team_rollout(
             field_turns_state[0] = dec
           }
         }
+        // しろいハーブ: 残り HP 処理 (Showdown onResidual)。EOT はランクを変えないので
+        // 実到達では no-op。DP の apply_eot と同じ判定点を置く。
+        apply_held_item_stat_reset_pair(
+          own, own_active, own_hps, own_ranks, own_item_consumed,
+          opp, opp_active, opp_hps, opp_ranks, opp_item_consumed,
+        )
 
         if all_ko(own_hps) {
           return -1.0
@@ -1828,6 +3031,8 @@ pub fn team_monte_carlo_value(
   turn_limit? : Int = MC_TURN_LIMIT,
   weather? : @model.Weather = @model.Weather::None,
   field? : @model.Field = @model.Field::None,
+  my_fresh? : Bool? = None,
+  opp_fresh? : Bool? = None,
 ) -> Double {
   if trials <= 0 {
     return 0.0
@@ -1835,7 +3040,9 @@ pub fn team_monte_carlo_value(
   let rng = seeded_rng(seed)
   let mut total = 0.0
   for _ in 0..<trials {
-    total += team_rollout(own, opp, rng, turn_limit~, weather~, field~)
+    total += team_rollout(
+      own, opp, rng, turn_limit~, weather~, field~, my_fresh~, opp_fresh~,
+    )
   }
   total / trials.to_double()
 }

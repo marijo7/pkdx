@@ -72,6 +72,10 @@ fn mk_field_state() -> SwitchingGameState {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -84,6 +88,8 @@ fn mk_field_state() -> SwitchingGameState {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }

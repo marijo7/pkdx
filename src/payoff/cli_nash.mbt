@@ -4,6 +4,11 @@
 /// Input JSON accepts either a direct payoff matrix or a list of characters
 /// (monocycle (p, v) form). Exactly one must be supplied.
 ///
+/// `matrix` may be any non-empty rectangle, including 1×N and N×1. Rows must
+/// all have the same length. `pkdx nash solve` solves that zero-sum game.
+/// `pkdx nash graph` still requires a square matrix: the DOT emitter draws
+/// one node set, with edge `i -> j` labeled `A[i, j]`.
+///
 /// ```
 /// {"matrix": [[0, 1, -1], [-1, 0, 1], [1, -1, 0]], "labels": ["A", "B", "C"]}
 /// {"characters": [{"label": "A", "power": 0, "v": {"x": 2, "y": 0}}, ...]}
@@ -12,24 +17,33 @@
 /// Solve output JSON schema:
 /// ```
 /// {"value": 0.0, "row_strategy": [...], "col_strategy": [...],
-///  "exploitability": 0.0, "support": {"row": [0,1,2], "col": [0,1,2]},
+///  "exploitability": 0.0, "nash_solver": "simplex",
+///  "support": {"row": [0,1,2], "col": [0,1,2]},
 ///  "labels": ["A","B","C"]}
 /// ```
+///
+/// Optional `nash_solver_config` (`tol`, `iterations`) is the same object
+/// `pkdx select` accepts. It only affects the iterative fallback used when
+/// simplex raises `SimplexFailure` or `InconsistentGame`.
 
 ///|
 pub suberror NashCliError {
   InvalidJson(String)
   MissingField(String)
   ConflictingInputs
+  /// `pkdx nash graph` matrix/characters input is rectangular but not square.
+  /// Payload is `(rows, cols)`. Ragged and empty matrices are `InvalidJson`.
+  /// `pkdx nash solve` accepts a non-square rectangle.
   NonSquareMatrix(Int, Int)
   LabelCountMismatch(Int, Int)
   InfeasibleGame
   UnboundedGame
   InnerError(String)
   /// Both iterative fallbacks (fictitious_play and mwu) exceeded `config.tol`
-  /// after the primary simplex raised. Carries the original simplex error
-  /// message and the observed exploitabilities so the CLI can report how
-  /// close each approximate solver came.
+  /// after the primary solver raised `SimplexFailure` or `InconsistentGame`.
+  /// `simplex_err` is that error's `Show` text (the field name predates the
+  /// `InconsistentGame` case) plus the observed exploitabilities, so the CLI
+  /// can report how close each approximate solver came.
   NashFallbackExhausted(
     simplex_err~ : String,
     fp_expl~ : Double,
@@ -82,15 +96,23 @@ fn parse_matrix_input(
       _ => raise InvalidJson("matrix[" + i.to_string() + "] must be an array")
     }
   }
-  // Validate rectangular shape.
+  // Rectangular and non-empty. A zero-sum matrix game does not need to be
+  // square; ragged rows and a 0-column matrix are still rejected.
   let cols = data[0].length()
+  if cols == 0 {
+    raise InvalidJson("matrix must be non-empty")
+  }
   for i in 1..<n {
     if data[i].length() != cols {
-      raise NonSquareMatrix(n, data[i].length())
+      raise InvalidJson(
+        "matrix rows have inconsistent lengths: row 0 has " +
+        cols.to_string() +
+        ", row " +
+        i.to_string() +
+        " has " +
+        data[i].length().to_string(),
+      )
     }
-  }
-  if n != cols {
-    raise NonSquareMatrix(n, cols)
   }
   data
 }
@@ -348,38 +370,63 @@ fn strategy_to_array(s : @nash.MixedStrategy) -> Array[Double] {
 }
 
 ///|
-/// Run `pkdx nash solve`. Returns a JSON string on success. Raises
-/// `InfeasibleGame` / `UnboundedGame` for degenerate LPs so the caller can exit
-/// non-zero.
+/// Read optional `nash_solver_config` from an already-validated solve payload.
+/// `parse_nash_input` ignores unknown fields, so this second look is what
+/// wires the same knobs `pkdx select` uses into `solve_with_fallback`.
+fn nash_config_of_solve_input(
+  input_json : String,
+) -> NashSolverConfig raise NashCliError {
+  let root = @json.parse(input_json) catch {
+    err => raise InvalidJson(@debug.to_string(err))
+  }
+  match root {
+    Object(obj) => parse_nash_solver_config(obj.get("nash_solver_config"))
+    _ => raise InvalidJson("top-level must be an object")
+  }
+}
+
+///|
+/// Run `pkdx nash solve`. Returns a JSON string on success.
+///
+/// The equilibrium comes from `solve_with_fallback`: simplex first, then
+/// fictitious play, then multiplicative weights, when simplex raises
+/// `SimplexFailure` or `InconsistentGame`. `InfeasibleGame` /
+/// `UnboundedGame` / `NashFallbackExhausted` still exit non-zero. Empty
+/// matrices and NaN/Inf are rejected before the solver.
+///
+/// On the simplex path, `exploitability` is recomputed with
+/// `@nash.exploitability` rather than taken from `NashSolverResult`. The
+/// wrapper stores `0.0` there by construction; the historical solve JSON
+/// reports the measured residual, and select's golden files do not go
+/// through this function.
 pub fn run_nash_solve(input_json : String) -> String raise NashCliError {
   let (matrix, labels) = parse_nash_input(input_json)
-  let lp = @nash.solve_zero_sum(matrix) catch {
-    err => raise InnerError(err.to_string())
-  }
-  match lp {
-    Optimal(value~, row_strategy~, col_strategy~) => {
-      let p = strategy_to_array(row_strategy)
-      let q = strategy_to_array(col_strategy)
-      let expl = @nash.exploitability(matrix, row_strategy, col_strategy)
-      let sup_row = support_indices(p, 1.0e-6)
-      let sup_col = support_indices(q, 1.0e-6)
-      let mut out = "{"
-      out = out + "\"value\":" + value.to_string()
-      out = out + ",\"row_strategy\":" + fmt_double_array(p)
-      out = out + ",\"col_strategy\":" + fmt_double_array(q)
-      out = out + ",\"exploitability\":" + expl.to_string()
-      out = out +
-        ",\"support\":{\"row\":" +
-        fmt_int_array(sup_row) +
-        ",\"col\":" +
-        fmt_int_array(sup_col) +
-        "}"
-      out = out + ",\"labels\":" + fmt_string_array(labels)
-      out + "}"
-    }
-    Infeasible => raise InfeasibleGame
-    Unbounded => raise UnboundedGame
-  }
+  let nash_config = nash_config_of_solve_input(input_json)
+  let result = solve_with_fallback(matrix, config=nash_config)
+  let p = strategy_to_array(result.row_strategy)
+  let q = strategy_to_array(result.col_strategy)
+  let expl = @nash.exploitability(
+    matrix,
+    result.row_strategy,
+    result.col_strategy,
+  )
+  let sup_row = support_indices(p, 1.0e-6)
+  let sup_col = support_indices(q, 1.0e-6)
+  let mut out = "{"
+  out = out + "\"value\":" + result.value.to_string()
+  out = out + ",\"row_strategy\":" + fmt_double_array(p)
+  out = out + ",\"col_strategy\":" + fmt_double_array(q)
+  out = out + ",\"exploitability\":" + expl.to_string()
+  out = out +
+    ",\"nash_solver\":\"" + solver_path_string(result.solver_path) + "\""
+  out = out +
+    ",\"support\":{\"row\":" +
+    fmt_int_array(sup_row) +
+    ",\"col\":" +
+    fmt_int_array(sup_col) +
+    "}"
+  out = out + ",\"labels\":" + fmt_string_array(labels)
+  out + "}"
 }
 
 ///|
@@ -416,6 +463,12 @@ pub fn run_nash_graph(
     return run_nash_graph_team(obj, threshold)
   }
   let (matrix, labels) = parse_nash_input(input_json)
+  // One node set: edge i -> j uses labels[i] and labels[j]. That is a
+  // matchup among the same actions, so a rectangular game (two action sets)
+  // is left to `pkdx nash solve`.
+  if matrix.rows() != matrix.cols() {
+    raise NonSquareMatrix(matrix.rows(), matrix.cols())
+  }
   let mut out = "digraph payoff {\n"
   for i in 0..<matrix.rows() {
     out = out + "  \"" + dot_escape(labels[i]) + "\";\n"

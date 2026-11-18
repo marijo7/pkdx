@@ -127,48 +127,18 @@ case "$OS_TAG" in
     echo "    transitive nash/payoff packages still trigger the linker pass."
     ;;
   windows)
-    echo "  Windows: required to override the macOS-only default for both"
-    echo "    'moon build' and 'moon test'. Install vcpkg + OpenBLAS first."
-    echo "    Use the MinGW-targeted triplet so the produced import library"
-    echo "    matches the MinGW gcc.exe pinned via MOON_CC below; vcpkg's"
-    echo "    'x64-windows' triplet targets MSVC cl.exe and would mix ABIs."
-    echo "    vcpkg autodetects MinGW gcc/g++ via PATH at install time, so"
-    echo "    run the install from a shell that has mingw-w64 on PATH (or"
-    echo "    prepend it inline). In cmd (NOT bash):"
-    echo "      set PATH=C:\\mingw64\\bin;%PATH%"
-    echo "      C:\\vcpkg\\vcpkg.exe install openblas:x64-mingw-dynamic"
-    echo "    Or in PowerShell:"
-    echo "      \$env:PATH = \"C:\\mingw64\\bin;\$env:PATH\""
-    echo "      C:\\vcpkg\\vcpkg.exe install openblas:x64-mingw-dynamic"
-    echo "    Then in this shell (Git Bash / MSYS), export link flags before"
-    echo "    'moon build' or 'moon test':"
-    echo "      export MOON_CC_LINK_FLAGS=\"-LC:/vcpkg/installed/x64-mingw-dynamic/lib -lopenblas\""
-    echo "    The -L/-l form is GCC-style; if MoonBit picks cl.exe (MSVC) it"
-    echo "    will not accept this syntax. MoonBit's native backend reads"
-    echo "    MOON_CC (NOT the conventional CC) for compiler override; pin"
-    echo "    MOON_CC to a mingw-w64 GCC by absolute path so resolution does"
-    echo "    not silently fall back to auto-detection (and pick up cl.exe):"
-    if [ -x "/c/mingw64/bin/gcc.exe" ]; then
-      echo "      export MOON_CC=\"C:/mingw64/bin/gcc.exe\"     # detected"
-    elif [ -x "/c/msys64/mingw64/bin/gcc.exe" ]; then
-      echo "      export MOON_CC=\"C:/msys64/mingw64/bin/gcc.exe\"   # detected (MSYS2)"
-    else
-      echo "      export MOON_CC=\"C:/mingw64/bin/gcc.exe\"     # adjust if MinGW is elsewhere"
-      echo "    No mingw-w64 GCC detected at C:/mingw64 or C:/msys64/mingw64."
-      echo "    Install MSYS2 (https://www.msys2.org/) and 'pacman -S"
-      echo "    mingw-w64-x86_64-gcc', or use the niXman/mingw-builds-binaries"
-      echo "    release that the GitHub Actions windows-2022 image uses."
-    fi
-    echo "    Also add C:/vcpkg/installed/x64-mingw-dynamic/bin to PATH so the"
-    echo "    DLL resolves at runtime (used by 'moon test')."
-    echo "    moon's lib/runtime/env.c calls rand_s(), which mingw-w64 only"
-    echo "    declares when _CRT_RAND_S is defined first. If the build fails"
-    echo "    with \"implicit declaration of function 'rand_s'\", prepend the"
-    echo "    define once:"
-    echo "      sed -i '1i #define _CRT_RAND_S' \"\$HOME/.moon/lib/runtime/env.c\""
-    echo "    Both 'moon build' and 'moon test' need OpenBLAS installed; the"
-    echo "    production binary does not call BLAS symbols itself but the"
-    echo "    transitive nash/payoff packages still trigger the linker pass."
+    echo "  Windows: BLAS/LAPACK is required for 'moon build' and 'moon test'."
+    echo "    The Windows target builds with MSVC (cl.exe / link.exe), so OpenBLAS"
+    echo "    must be MSVC-format. Install the static OpenBLAS with LAPACK through"
+    echo "    the pinned vcpkg overlay in scripts/windows-blas. In PowerShell, from"
+    echo "    the repo root:"
+    echo "      \$vcpkg = Join-Path \$env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'"
+    echo "      & \$vcpkg install --triplet x64-windows-static --overlay-ports=scripts/windows-blas/ports --x-manifest-root=scripts/windows-blas --x-install-root=C:\\blas\\installed"
+    echo "    Then, in the Git Bash shell used for 'moon build' / 'moon test':"
+    echo "      export PKDX_OPENBLAS_ROOT=\"C:/blas/installed/x64-windows-static\""
+    echo "    scripts/configure_native_link_flags.sh reads PKDX_OPENBLAS_ROOT and"
+    echo "    emits the .lib path and -I flags. MinGW gcc is not used: moon's Windows"
+    echo "    runtime rejects it (\"Currently only MSVC is supported on Windows\")."
     ;;
 esac
 
@@ -206,7 +176,7 @@ fi
 # when running `pkdx migrate` with an older release binary.
 if [ "$NEED_DOWNLOAD" = true ] && command -v moon &>/dev/null; then
   echo "  No local build; moon detected. Building from source..."
-  if (cd "$REPO_ROOT" && moon build --target native --release src/main); then
+  if (cd "$REPO_ROOT" && bash scripts/moon_build_native.sh --release); then
     if [ -f "$LOCAL_BUILD" ]; then
       echo "  Local build complete."
       NEED_DOWNLOAD=false
@@ -251,8 +221,8 @@ if [ "$NEED_DOWNLOAD" = true ]; then
       echo "  Downloaded to $BINARY"
     else
       echo "  Warning: No release found. You can build locally instead:"
-      echo "    moon build --target native"
-      echo "  (requires MoonBit toolchain: curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash)"
+      echo "    bash scripts/moon_build_native.sh"
+      echo "  (requires MoonBit toolchain: bash scripts/install_moon.sh)"
     fi
   }
 fi
@@ -324,8 +294,8 @@ if [ -f "$REPO_ROOT/pokedex/pokedex.db" ]; then
     echo "" >&2
     echo "  Your pkdx binary predates one or more source migrations." >&2
     echo "  Install the MoonBit toolchain and rebuild from source, then rerun:" >&2
-    echo "    curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash" >&2
-    echo "    moon build --target native --release src/main" >&2
+    echo "    bash scripts/install_moon.sh" >&2
+    echo "    bash scripts/moon_build_native.sh --release" >&2
     echo "    ./setup.sh" >&2
     exit 1
   fi

@@ -39,6 +39,7 @@ fn mk_move(
     healing: None,
     weather_set: None,
     field_set: None,
+    flinch_chance: 0,
   }
 }
 
@@ -259,15 +260,30 @@ test "per_side_attempt: Paralyze + UseMove + acc=100 -> 0.125 skip / 0.875 act" 
 }
 
 ///|
-test "per_side_attempt: Sleep(n>0) always skips and decrements counter" {
+// Champions 規則 (help_syn.json:26333) に合わせて更新: 旧仕様は Sleep(n>0) を
+// 一律の確定 skip としていたが、2 回目 (Sleep(1)) は 1/3 で目覚めるため確定 skip
+// ではなくなった。確定 skip は Sleep(2) (1 回目) のみ。詳細は
+// switching_game_sleep_wbtest.mbt を参照。
+test "per_side_attempt: Sleep(2) is a sure skip and decrements to Sleep(1)" {
   let out = per_side_attempt(@model.Sleep(2), false, UseMove(0), 100)
   @debug.assert_eq(out.length(), 1)
   assert_false(out[0].acts)
   @debug.assert_eq(out[0].post_status, @model.Sleep(1))
-  let out2 = per_side_attempt(@model.Sleep(1), false, UseMove(0), 100)
-  @debug.assert_eq(out2.length(), 1)
-  assert_false(out2[0].acts)
-  @debug.assert_eq(out2[0].post_status, @model.Sleep(0))
+}
+
+///|
+test "per_side_attempt: Sleep(1) is no longer a sure skip (1/3 wake on 2nd attempt)" {
+  let out = per_side_attempt(@model.Sleep(1), false, UseMove(0), 100)
+  @debug.assert_eq(out.length(), 2)
+  let total = sum_probs(out)
+  assert_true((total - 1.0).abs() < 1.0e-9)
+  let mut woke = false
+  for a in out {
+    if a.acts {
+      woke = true
+    }
+  }
+  assert_true(woke)
 }
 
 ///|
@@ -402,11 +418,17 @@ test "eot_leftovers_heal: non-leftovers items are no-op" {
 
 ///|
 test "apply_eot: たべのこし heals before status slip" {
-  // たべのこし 装備 + Burn 状態。EOT 順は heal → burn slip。
-  // pre 80 → +160/16 = 90 → 90 - 160/16 = 80 (差し引きゼロ)。
+  // たべのこし 装備 + Burn。EOT 順は heal → burn slip。
+  // actual_stats の HP をプール (pokemon.hp = 100) に揃える。回復は
+  // effective_hp、やけど slip はプールで、どちらも 100/16 = 6。
+  // pre 80 → 86 → 80。
   let poke = mk_test_pokemon("d", "ノーマル")
   let mut combatant = mk_test_combatant(poke)
-  combatant = { ..combatant, item: "たべのこし" }
+  combatant = {
+    ..combatant,
+    item: "たべのこし",
+    actual_stats: Some([100, 100, 100, 100, 100, 100]),
+  }
   let team = [combatant]
   let mut state = mk_test_state(1, 80, 80, @model.Burn, @model.None)
   state = { ..state, my_must_recharge: [false], opp_must_recharge: [false] }
@@ -497,6 +519,10 @@ fn mk_test_state(
     my_disguise_busted: Array::make(team_size, false),
     opp_item_consumed: Array::make(team_size, false),
     opp_disguise_busted: Array::make(team_size, false),
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -509,6 +535,8 @@ fn mk_test_state(
     opp_wish_turns: no_wish_pending(team_size),
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -824,6 +852,10 @@ fn mk_same_turn_state(
     my_disguise_busted: [false],
     opp_item_consumed: [false],
     opp_disguise_busted: [false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -836,6 +868,8 @@ fn mk_same_turn_state(
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -964,8 +998,11 @@ test "resolve_moves: faster Spore locks slower target out of the same turn" {
   )
   @debug.assert_eq(outs.length(), 1)
   let (_p, ns) = outs[0]
-  // Target must now be asleep with the initial Sleep(2) counter.
-  @debug.assert_eq(ns.opp_status[0], @model.Sleep(2))
+  // Target is asleep. The landing turn is its first move attempt (a sure
+  // skip, see `consume_sleep_attempt_on_block`), so the counter is Sleep(1)
+  // and the next attempt is the 1/3 wake-up check (Champions help_syn.json:26333).
+  // Before the Champions rule this was Sleep(2).
+  @debug.assert_eq(ns.opp_status[0], @model.Sleep(1))
   // Target did not act this turn: faster Spore user is still at full HP.
   @debug.assert_eq(ns.my_hps[0], 200)
   // Spore does no damage; the target's HP is untouched too.
@@ -1374,6 +1411,10 @@ test "attempt_turn_with_cache: forced switch after recharger faints to EOT" {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false],
     opp_disguise_busted: [false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -1386,6 +1427,8 @@ test "attempt_turn_with_cache: forced switch after recharger faints to EOT" {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
   let outs1 = attempt_turn_with_cache(

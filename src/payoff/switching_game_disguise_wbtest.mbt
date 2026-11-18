@@ -88,6 +88,7 @@ fn sgd_move(
     healing,
     weather_set: None,
     field_set: None,
+    flinch_chance: 0,
   }
 }
 
@@ -158,6 +159,10 @@ fn sgd_state(
     opp_item_consumed: [false],
     my_disguise_busted: [false],
     opp_disguise_busted: [opp_busted],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -170,6 +175,8 @@ fn sgd_state(
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -356,6 +363,10 @@ test "disguise: busted flag persists across switch round-trip" {
     opp_must_recharge: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [true, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     opp_leech_seeded: [false, false],
     opp_protean_locked: ["", ""],
   }

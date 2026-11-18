@@ -20,6 +20,15 @@ test "StatusCondition equality: Sleep counter distinguishes variants" {
 }
 
 ///|
+/// Rest 由来の眠り (`RestSleep`) は同じ残カウンタでも通常のねむり (`Sleep`) と
+/// 別状態として扱う (2 回目の目覚め抽選の有無が違うため)。
+test "StatusCondition equality: RestSleep is distinct from Sleep with same counter" {
+  assert_true(RestSleep(2) == RestSleep(2))
+  assert_true(!(RestSleep(2) == Sleep(2)))
+  assert_true(!(RestSleep(1) == Sleep(1)))
+}
+
+///|
 test "StatusKind round trip via from_jp" {
   @debug.debug_inspect(
     status_kind_from_jp("まひ"),
@@ -90,6 +99,18 @@ test "status_kind_from_jp: あくび maps to DrowsyKind" {
     status_kind_from_jp("あくび"),
     content="Some(DrowsyKind)",
   )
+}
+
+///|
+test "status_kind_to_jp: every kind round-trips through status_kind_from_jp" {
+  let kinds : Array[StatusKind] = [
+    ParalyzeKind, BurnKind, PoisonKind, BadPoisonKind, SleepKind, FreezeKind, DrowsyKind,
+  ]
+  for k in kinds {
+    assert_true(status_kind_from_jp(status_kind_to_jp(k)) == Some(k))
+  }
+  @debug.debug_inspect(status_kind_to_jp(BurnKind), content="\"やけど\"")
+  @debug.debug_inspect(status_kind_to_jp(BadPoisonKind), content="\"もうどく\"")
 }
 
 ///|

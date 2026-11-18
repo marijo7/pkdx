@@ -55,6 +55,11 @@ pub(all) struct DamageKey {
   // 一度計算した reduced 値が busted 相手の lookup を shadow / alias してしまう
   // (protean_locked を key に含めるのと同じ理屈)。
   def_disguise_intact : Bool
+  // もらいび状態。炎技の威力 1.5 は状態が立っている攻撃側だけ。防御側のビットは
+  // 反射技の Step1 (相手がもらいび) を分ける。どちらも false のキーは、もらいびの
+  // 炎技が無い入力では計算結果が従来と一致する。
+  atk_flash_fire : Bool
+  def_flash_fire : Bool
 } derive(Eq, Hash)
 
 ///|
@@ -131,7 +136,10 @@ pub fn new_damage_cache(
 ///     alt-form rows have distinct Japanese names). Types / base stats /
 ///     weight therefore follow from the name.
 ///   * `move_` (`Move`) — keyed by `mv.name`. Move rows are 1:1 with name
-///     per version, so power / type / category / accuracy follow.
+///     per version, so power / type / category / accuracy follow. The
+///     exception is ちからずく: select JSON does not backfill secondaries, so
+///     the same name can be boosted or not. That bit is `sheer_force_boost`
+///     (`sheer_force_boost_applies`), not the move name.
 ///   * `atk_ability` / `def_ability` / `atk_item` / `def_item` — encoded.
 ///   * `weather` / `field` — canonicalized to "": payoff always passes
 ///     `Weather::None` / `Field::None` via `build_input_with_ranks`.
@@ -213,7 +221,7 @@ fn combatant_to_cache_key_input(
     defender: dfn.pokemon.name_ja,
     move_name: mv.name,
     atk_ability: atk.ability,
-    def_ability: dfn.ability,
+    def_ability: defender_ability_for_move(atk.ability, dfn.ability),
     atk_item: atk.item,
     def_item: dfn.item,
     weather: weather_str,
@@ -260,6 +268,7 @@ fn combatant_to_cache_key_input(
     incoming_critical: false,
     atk_protean_locked,
     def_protean_locked,
+    sheer_force_boost: @damage.sheer_force_boost_applies(atk.ability, mv),
   }
 }
 
@@ -297,6 +306,8 @@ fn mean_damage_via_disk(
   protean_consumed? : Bool = false,
   atk_protean_locked? : String = "",
   def_protean_locked? : String = "",
+  atk_flash_fire? : Bool = false,
+  def_flash_fire? : Bool = false,
 ) -> Int {
   // 反射技は L2 disk を経由しない。@damage.calc_damage に incoming=None で
   // 渡すと反射 fallback が走り 0 ダメージの JSON が書き込まれてしまうため、
@@ -316,6 +327,8 @@ fn mean_damage_via_disk(
       weather~,
       field~,
       protean_consumed~,
+      atk_flash_fire~,
+      def_flash_fire~,
     )
   }
   let disk = match cache.disk {
@@ -331,6 +344,8 @@ fn mean_damage_via_disk(
         weather~,
         field~,
         protean_consumed~,
+        atk_flash_fire~,
+        def_flash_fire~,
       )
   }
   let key_input = combatant_to_cache_key_input(
@@ -357,6 +372,8 @@ fn mean_damage_via_disk(
         weather~,
         field~,
         protean_consumed~,
+        atk_flash_fire~,
+        def_flash_fire~,
       )
   }
   match @damage_cache.get(disk, key) {
@@ -481,6 +498,8 @@ fn prepare_damage_lookup(
   atk_protean_locked? : String = "",
   def_protean_locked? : String = "",
   def_disguise_intact? : Bool = false,
+  atk_flash_fire? : Bool = false,
+  def_flash_fire? : Bool = false,
 ) -> (Bool, DamageKey, Combatant, Combatant, @model.Move) {
   let raw_attacker_full = if my_attacker {
     my_team[atk_idx]
@@ -527,6 +546,8 @@ fn prepare_damage_lookup(
       atk_protean_locked,
       def_protean_locked,
       def_disguise_intact,
+      atk_flash_fire,
+      def_flash_fire,
     }
     return (true, dummy_key, raw_attacker, raw_defender, mv)
   }
@@ -557,6 +578,8 @@ fn prepare_damage_lookup(
     atk_protean_locked,
     def_protean_locked,
     def_disguise_intact,
+    atk_flash_fire,
+    def_flash_fire,
   }
   (false, key, raw_attacker, raw_defender, mv)
 }
@@ -586,6 +609,8 @@ pub fn mean_damage_cached(
   atk_protean_locked? : String = "",
   def_protean_locked? : String = "",
   def_disguise_intact? : Bool = false,
+  atk_flash_fire? : Bool = false,
+  def_flash_fire? : Bool = false,
 ) -> Int {
   let (early, key, raw_attacker, raw_defender, mv) = prepare_damage_lookup(
     my_attacker,
@@ -606,6 +631,8 @@ pub fn mean_damage_cached(
     atk_protean_locked~,
     def_protean_locked~,
     def_disguise_intact~,
+    atk_flash_fire~,
+    def_flash_fire~,
   )
   if early {
     return 0
@@ -617,7 +644,7 @@ pub fn mean_damage_cached(
     }
     None => {
       cache.misses = cache.misses + 1
-      let attacker = effective_combatant(
+      let attacker_eff = effective_combatant(
         raw_attacker,
         atk_mega,
         protean_locked=atk_protean_locked,
@@ -626,6 +653,10 @@ pub fn mean_damage_cached(
         raw_defender,
         def_mega,
         protean_locked=def_protean_locked,
+      )
+      // 未発動のもらいびは炎技だけ能力名を外す。発動中・非炎・他特性は同一オブジェクト。
+      let attacker = attacker_for_flash_fire(
+        attacker_eff, mv, weather, atk_flash_fire,
       )
       // Protean ロック中は attacker の type1 が override 済みなので engine の
       // 二重 STAB push を止める (build_input_with_ranks の protean_consumed)。
@@ -654,6 +685,8 @@ pub fn mean_damage_cached(
           field~,
           protean_consumed~,
           def_disguise_intact=true,
+          atk_flash_fire~,
+          def_flash_fire~,
         )
       } else {
         match cache.disk {
@@ -673,6 +706,8 @@ pub fn mean_damage_cached(
               protean_consumed~,
               atk_protean_locked~,
               def_protean_locked~,
+              atk_flash_fire~,
+              def_flash_fire~,
             )
           None =>
             compute_mean_damage(
@@ -687,6 +722,8 @@ pub fn mean_damage_cached(
               weather~,
               field~,
               protean_consumed~,
+              atk_flash_fire~,
+              def_flash_fire~,
             )
         }
       }
@@ -730,6 +767,8 @@ fn damage_variants_cached(
   atk_protean_locked? : String = "",
   def_protean_locked? : String = "",
   def_disguise_intact? : Bool = false,
+  atk_flash_fire? : Bool = false,
+  def_flash_fire? : Bool = false,
 ) -> Array[@model.DamageOutcome] {
   let (early, key, raw_attacker, raw_defender, mv) = prepare_damage_lookup(
     my_attacker,
@@ -750,6 +789,8 @@ fn damage_variants_cached(
     atk_protean_locked~,
     def_protean_locked~,
     def_disguise_intact~,
+    atk_flash_fire~,
+    def_flash_fire~,
   )
   if early {
     return [{ probability: 1.0, mean_damage: 0, hits_count: 1, hit_steps: [] }]
@@ -761,7 +802,7 @@ fn damage_variants_cached(
     }
     None => {
       cache.misses = cache.misses + 1
-      let attacker = effective_combatant(
+      let attacker_eff = effective_combatant(
         raw_attacker,
         atk_mega,
         protean_locked=atk_protean_locked,
@@ -770,6 +811,9 @@ fn damage_variants_cached(
         raw_defender,
         def_mega,
         protean_locked=def_protean_locked,
+      )
+      let attacker = attacker_for_flash_fire(
+        attacker_eff, mv, weather, atk_flash_fire,
       )
       // Protean ロック中は attacker の type1 が override 済みなので engine の
       // 二重 STAB push を止める (build_input_with_ranks の protean_consumed)。
@@ -787,6 +831,8 @@ fn damage_variants_cached(
         field~,
         protean_consumed~,
         def_disguise_intact~,
+        atk_flash_fire~,
+        def_flash_fire~,
       )
       cache.variants_data[key] = v
       // Touch the L2 disk cache so cross-session damage entries stay
@@ -818,6 +864,8 @@ fn damage_variants_cached(
               protean_consumed~,
               atk_protean_locked~,
               def_protean_locked~,
+              atk_flash_fire~,
+              def_flash_fire~,
             )
           }
           None => ()

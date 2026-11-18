@@ -50,6 +50,7 @@ fn mk_heal_move(
     healing,
     weather_set,
     field_set: None,
+    flinch_chance: 0,
   }
 }
 
@@ -197,6 +198,10 @@ test "with_post_hit_effects: FixedFraction heals attacker active slot" {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -209,6 +214,8 @@ test "with_post_hit_effects: FixedFraction heals attacker active slot" {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
   let mv = mk_heal_move(
@@ -303,6 +310,10 @@ fn mk_weather_state() -> SwitchingGameState {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -315,6 +326,8 @@ fn mk_weather_state() -> SwitchingGameState {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -499,7 +512,7 @@ test "with_post_hit_effects: 通常技は weather を書き換えない" {
 }
 
 // =================================================================
-// Stage 6: WeatherDependent healing (つきのひかり / あさのひざし / シンセシス)
+// Stage 6: WeatherDependent healing (つきのひかり / あさのひざし / こうごうせい)
 // =================================================================
 //
 // `HealingEffect::WeatherDependent(default_n, default_d, sunny_n, sunny_d,
@@ -509,7 +522,7 @@ test "with_post_hit_effects: 通常技は weather を書き換えない" {
 //   - Rain / Sand / Snow  → (harsh_n, harsh_d)   = (1, 4)   (= max / 4 回復)
 //   - None                → (default_n, default_d) = (1, 2) (= max / 2 回復)
 //
-// data.json では つきのひかり / あさのひざし / シンセシス すべて
+// data.json では つきのひかり / あさのひざし / こうごうせい すべて
 // (1,2) / (2,3) / (1,4) の triple を持つ。本テストは「つきのひかり」を代表
 // として 5 天候境界 + 動的切り替え (晴れ→消滅で default に戻る) を pin する。
 
@@ -707,14 +720,16 @@ fn mk_rest_move() -> @model.Move {
 
 ///|
 /// Case R-1: HP=1 / status=Burn / ability=normal で Rest を撃つと
-/// HP=max=100 / status=Sleep(2)。Burn が Sleep(2) に上書きされる本家挙動。
-test "apply_healing: Rest from Burn restores HP=max and overwrites status to Sleep(2)" {
+/// HP=max=100 / status=RestSleep(2)。Burn が RestSleep(2) に上書きされる本家挙動。
+/// (眠りの種類は Rest 由来の RestSleep: 2 回目の 1/3 目覚め抽選を持たない。
+/// 旧仕様は Sleep(2) で、Champions 規則の導入に伴い RestSleep(2) に変更。)
+test "apply_healing: Rest from Burn restores HP=max and overwrites status to RestSleep(2)" {
   let hps = [1, 100]
   let status : Array[@model.StatusCondition] = [@model.Burn, @model.None]
   let mv = mk_rest_move()
   apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "", 0, "")
   @debug.assert_eq(hps[0], 100)
-  @debug.assert_eq(status[0], @model.Sleep(2))
+  @debug.assert_eq(status[0], @model.RestSleep(2))
   // 非 active slot は不変。
   @debug.assert_eq(hps[1], 100)
   @debug.assert_eq(status[1], @model.None)
@@ -722,17 +737,17 @@ test "apply_healing: Rest from Burn restores HP=max and overwrites status to Sle
 
 ///|
 /// Case R-2: HP=1 / status=Sleep(0) / ability=normal で Rest を撃つと
-/// HP=max / status=Sleep(2)。Sleep カウンタが 0 (まもなく覚醒) でも Rest で
+/// HP=max / status=RestSleep(2)。Sleep カウンタが 0 (まもなく覚醒) でも Rest で
 /// 2 にリセットされる (本家「Rest は既存 Sleep の残ターンを上書きする」)。
 /// HP=max では Rest が失敗するため、Sleep カウンタリセット観察用には
 /// HP < max のシナリオで pin する。
-test "apply_healing: Rest resets Sleep(0) counter to Sleep(2)" {
+test "apply_healing: Rest resets Sleep(0) counter to RestSleep(2)" {
   let hps = [1]
   let status : Array[@model.StatusCondition] = [@model.Sleep(0)]
   let mv = mk_rest_move()
   apply_healing(mv, 0, hps, 100, @model.Weather::None, status, "", 0, "")
   @debug.assert_eq(hps[0], 100)
-  @debug.assert_eq(status[0], @model.Sleep(2))
+  @debug.assert_eq(status[0], @model.RestSleep(2))
 }
 
 ///|
@@ -831,7 +846,7 @@ test "apply_healing: Rest fails under Sweet Veil (スイートベール)" {
 ///|
 /// Case R-7: ability=マジックガード (Magic Guard) では Rest は失敗しない。
 /// Magic Guard は residual damage を 0 化する特性であって Sleep の付与を
-/// 阻止しないことを境界で pin。HP=max / status=Sleep(2) に遷移する。
+/// 阻止しないことを境界で pin。HP=max / status=RestSleep(2) に遷移する。
 test "apply_healing: Magic Guard does NOT block Rest (Sleep is inflicted)" {
   let hps = [1]
   let status : Array[@model.StatusCondition] = [@model.Burn]
@@ -848,7 +863,7 @@ test "apply_healing: Magic Guard does NOT block Rest (Sleep is inflicted)" {
     "",
   )
   @debug.assert_eq(hps[0], 100)
-  @debug.assert_eq(status[0], @model.Sleep(2))
+  @debug.assert_eq(status[0], @model.RestSleep(2))
 }
 
 // -----------------------------------------------------------------
@@ -928,7 +943,7 @@ test "apply_healing: Rest succeeds on airborne user under Electric Terrain" {
     attacker_grounded=false,
   )
   @debug.assert_eq(hps[0], 100)
-  @debug.assert_eq(status[0], @model.Sleep(2))
+  @debug.assert_eq(status[0], @model.RestSleep(2))
 }
 
 ///|
@@ -953,7 +968,7 @@ test "apply_healing: Rest succeeds on grounded user under Grassy Terrain" {
     attacker_grounded=true,
   )
   @debug.assert_eq(hps[0], 100)
-  @debug.assert_eq(status[0], @model.Sleep(2))
+  @debug.assert_eq(status[0], @model.RestSleep(2))
 }
 
 // =================================================================
@@ -1269,6 +1284,10 @@ test "with_post_hit_effects: Drain heals attacker by dealt/2" {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -1281,6 +1300,8 @@ test "with_post_hit_effects: Drain heals attacker by dealt/2" {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
   let mv = mk_drain_move()
@@ -1352,6 +1373,10 @@ test "with_post_hit_effects: Drain reversed by defender's ヘドロえき" {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -1364,6 +1389,8 @@ test "with_post_hit_effects: Drain reversed by defender's ヘドロえき" {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
   let mv = mk_drain_move()
@@ -1485,6 +1512,10 @@ fn mk_seed_state() -> SwitchingGameState {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -1497,6 +1528,8 @@ fn mk_seed_state() -> SwitchingGameState {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -2085,6 +2118,10 @@ fn mk_painsplit_state() -> SwitchingGameState {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -2097,6 +2134,8 @@ fn mk_painsplit_state() -> SwitchingGameState {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -2363,6 +2402,10 @@ fn mk_wish_state() -> SwitchingGameState {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false, false],
     opp_disguise_busted: [false, false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -2375,6 +2418,8 @@ fn mk_wish_state() -> SwitchingGameState {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }
@@ -2807,6 +2852,10 @@ test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false],
     opp_disguise_busted: [false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -2819,6 +2868,8 @@ test "attempt_turn_with_cache: Wish used on turn T heals at EOT(T+1)" {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
   // Turn T: my[0] uses Wish, opp uses idle. EOT inside attempt_turn_with_cache
@@ -2913,6 +2964,10 @@ test "attempt_turn_with_cache: Switch threads Wish to replacement (real path)" {
     my_disguise_busted: [false, false],
     opp_item_consumed: [false],
     opp_disguise_busted: [false],
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: [],
     opp_moves_used: [],
     weather: @model.Weather::None,
@@ -2925,6 +2980,8 @@ test "attempt_turn_with_cache: Switch threads Wish to replacement (real path)" {
     opp_wish_turns: -1,
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
   // Turn T: my[0] uses Wish, EOT ticks 2 → 1.

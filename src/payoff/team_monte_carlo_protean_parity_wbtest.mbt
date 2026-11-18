@@ -77,6 +77,10 @@ fn pl_parity_state(
     my_disguise_busted: Array::make(my_team.length(), false),
     opp_item_consumed: Array::make(opp_team.length(), false),
     opp_disguise_busted: Array::make(opp_team.length(), false),
+    my_flinched: false,
+    opp_flinched: false,
+    my_fresh: None,
+    opp_fresh: None,
     my_moves_used: Array::make(my_team.length(), 0),
     opp_moves_used: Array::make(opp_team.length(), 0),
     weather: @model.Weather::None,
@@ -89,6 +93,8 @@ fn pl_parity_state(
     opp_wish_turns: no_wish_pending(opp_team.length()),
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: [],
+    opp_flash_fire: [],
     turn: 0,
   }
 }

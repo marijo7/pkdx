@@ -1,23 +1,26 @@
 ///|
 /// Priority-aware, rank-aware turn order sign between the two actives for the
 /// given moves. Returns `+1` if my active acts first, `-1` if opp acts first,
-/// `0` on full ties. Reads priority directly from `@model.Move.priority`
-/// (populated by `query_moves` via the `move_meta` DB JOIN).
+/// `0` on full ties. Priority is the ability-adjusted value
+/// (`combatant_move_priority`: いたずらごころ / はやてのつばさ), not the raw
+/// `Move.priority`. `me_hp` / `opp_hp` are the turn-start HP used for 満タン.
 ///
 /// When either side is currently running on mega-form stats (`me_mega` /
-/// `opp_mega`), the post-mega speed base is used for the tie-breaker. Priority
-/// is never affected by mega evolution, so it reads straight from the move.
+/// `opp_mega`), the post-mega speed and the post-mega ability are used.
+/// Mega does not change `pokemon.hp`, which is the full-HP denominator.
 fn move_turn_sign(
   me : Combatant,
   me_ranks : Array[Int],
   mv_me : @model.Move,
   me_mega : Bool,
   me_para : Bool,
+  me_hp : Int,
   opp : Combatant,
   opp_ranks : Array[Int],
   mv_opp : @model.Move,
   opp_mega : Bool,
   opp_para : Bool,
+  opp_hp : Int,
 ) -> Int {
   let me_eff = effective_combatant(me, me_mega)
   let opp_eff = effective_combatant(opp, opp_mega)
@@ -28,10 +31,10 @@ fn move_turn_sign(
   let eff_opp = if opp_para { base_opp / 2 } else { base_opp }
   turn_order_sign(
     me_eff,
-    mv_me.priority,
+    effective_priority(me_eff.ability, mv_me, me_hp, me_eff.pokemon.hp),
     eff_me,
     opp_eff,
-    mv_opp.priority,
+    effective_priority(opp_eff.ability, mv_opp, opp_hp, opp_eff.pokemon.hp),
     eff_opp,
   )
 }
@@ -50,8 +53,305 @@ fn action_blocked_by_fresh_status(
 ) -> Bool {
   match (pre, now) {
     (@model.None, @model.Sleep(_)) => true
+    (@model.None, @model.RestSleep(_)) => true
     _ => false
   }
+}
+
+///|
+/// こおり (Freeze) の技が こおり を付与しうるか (追加効果 `status_effect` が FreezeKind で
+/// chance > 0)。Champions 本文の「凍らせる」技 (れいとうビーム 等) がこれに当たる。
+fn move_can_freeze(mv : @model.Move) -> Bool {
+  match mv.status_effect {
+    Some((@model.FreezeKind, chance)) => chance > 0
+    _ => false
+  }
+}
+
+///|
+/// 行動が解凍技 (defrost) で、かつ使用者が解凍技として扱える (もえつきる は炎タイプ使用者のみ、
+/// Champions 本文 wazainfo_syn.json:12460 "fails unless it is used by a Fire type")。
+/// `per_side_attempt` の `thaws_user` に渡す。Move ではない行動 (Switch) は false。
+fn freeze_move_thaws_user(
+  state : SwitchingGameState,
+  is_me : Bool,
+  team : Array[Combatant],
+  action : ActionKind,
+) -> Bool {
+  let active = if is_me { state.my_active } else { state.opp_active }
+  match action_move_of(team, active, action) {
+    Some(mv) =>
+      if !@damage.is_defrost_user_move(mv.name) {
+        false
+      } else if mv.name == "もえつきる" {
+        let megaed = if is_me { state.my_megaed } else { state.opp_megaed }
+        let is_mega = active < megaed.length() && megaed[active]
+        let eff = effective_combatant(team[active], is_mega)
+        eff.pokemon.type1 == "ほのお" || eff.pokemon.type2 == "ほのお"
+      } else {
+        true
+      }
+    None => false
+  }
+}
+
+///|
+/// こおり の解凍抽選を行動時点へ遅らせるか (DP / MC 共通の規則)。自分が技を出し、相手も技を
+/// 出す (交代ではない) ときに限る。
+/// - 自分が凍っている (解凍技を除く): 相手の技が解凍 (炎の命中 / thawsTarget) しうるので遅らせる。
+/// - 自分が凍っていない: 相手の技が こおり を付与しうる (追加効果) ときだけ遅らせる。
+/// 遅らせた側は行動時点で `per_side_attempt` (解凍抽選 → 命中) を振るので、先攻の技の結果
+/// (解凍・凍結) が後攻の試行に反映される。それ以外は従来どおり事前抽選 (分布は同一)。
+fn freeze_roll_deferred(
+  state : SwitchingGameState,
+  is_me : Bool,
+  action : ActionKind,
+  team : Array[Combatant],
+  opp_action : ActionKind,
+  opp_team : Array[Combatant],
+) -> Bool {
+  let active = if is_me { state.my_active } else { state.opp_active }
+  let opp_active = if is_me { state.opp_active } else { state.my_active }
+  let status = if is_me {
+    state.my_status[active]
+  } else {
+    state.opp_status[active]
+  }
+  let recharge = if is_me {
+    state.my_must_recharge[active]
+  } else {
+    state.opp_must_recharge[active]
+  }
+  let is_move = match action {
+    UseMove(_) | Mega(_) => true
+    Switch(_) => false
+  }
+  let opp_is_move = match opp_action {
+    UseMove(_) | Mega(_) => true
+    Switch(_) => false
+  }
+  if !is_move || !opp_is_move || recharge {
+    return false
+  }
+  if freeze_move_thaws_user(state, is_me, team, action) {
+    return false
+  }
+  match status {
+    @model.Freeze(_) => true
+    @model.None =>
+      match action_move_of(opp_team, opp_active, opp_action) {
+        Some(mv) => move_can_freeze(mv)
+        None => false
+      }
+    _ => false
+  }
+}
+
+///|
+/// ひるみ (追加効果 `flinch_chance`) の抽選を行動時点へ遅らせるか。自分が技を出し、相手も技を出す
+/// (交代ではない) ときに、相手の技がひるみを付与しうる (`flinch_chance > 0`) なら遅らせる。
+/// ひるみは後攻の行動を止めるので、後攻の試行 (眠り / 凍結 / まひ / 命中) は先攻の技の結果を見て
+/// から振る必要がある。先攻側は遅らせても分布は変わらない (先攻の試行は他の結果に依存しない)。
+/// 遅らせた側の試行は `resolve_pending_attempt` が行動時点で振る。
+fn flinch_roll_deferred(
+  state : SwitchingGameState,
+  is_me : Bool,
+  action : ActionKind,
+  team : Array[Combatant],
+  opp_action : ActionKind,
+  opp_team : Array[Combatant],
+) -> Bool {
+  let active = if is_me { state.my_active } else { state.opp_active }
+  let recharge = if is_me {
+    state.my_must_recharge[active]
+  } else {
+    state.opp_must_recharge[active]
+  }
+  let is_move = match action {
+    UseMove(_) | Mega(_) => true
+    Switch(_) => false
+  }
+  let opp_is_move = match opp_action {
+    UseMove(_) | Mega(_) => true
+    Switch(_) => false
+  }
+  if !is_move || !opp_is_move || recharge {
+    return false
+  }
+  let opp_active = if is_me { state.opp_active } else { state.my_active }
+  // ひるませる側の fresh。ねこだまし は Some(true) 以外では実効確率 0 なので遅らせない。
+  // はやてがえし は相手の選択の実効優先度が > 0 でないと失敗するので、そのときは遅らせない。
+  let flincher_fresh = if is_me { state.opp_fresh } else { state.my_fresh }
+  let target_mv = action_move_of(team, active, action)
+  let target_hp = if is_me { state.my_hps[active] } else { state.opp_hps[active] }
+  let target_megaed = if is_me { state.my_megaed } else { state.opp_megaed }
+  let target_mega = active < target_megaed.length() && target_megaed[active]
+  let target_eff = effective_combatant(team[active], target_mega)
+  match action_move_of(opp_team, opp_active, opp_action) {
+    Some(mv) =>
+      flinch_chance_vs_choice(
+        mv,
+        flincher_fresh,
+        target_mv,
+        foe_ability=target_eff.ability,
+        foe_hp=target_hp,
+        foe_max_hp=target_eff.pokemon.hp,
+      ) > 0
+    None => false
+  }
+}
+
+///|
+/// 行動時点で振る試行 (保留) の判定。こおり (`freeze_roll_deferred`) かひるみ
+/// (`flinch_roll_deferred`) のどちらかで遅らせる。
+fn attempt_roll_deferred(
+  state : SwitchingGameState,
+  is_me : Bool,
+  action : ActionKind,
+  team : Array[Combatant],
+  opp_action : ActionKind,
+  opp_team : Array[Combatant],
+) -> Bool {
+  freeze_roll_deferred(state, is_me, action, team, opp_action, opp_team) ||
+  flinch_roll_deferred(state, is_me, action, team, opp_action, opp_team)
+}
+
+///|
+/// ターン内ひるみフラグを両サイドとも false に戻す (ひるみは持ち越さない)。
+fn clear_turn_flinch(state : SwitchingGameState) -> SwitchingGameState {
+  if !state.my_flinched && !state.opp_flinched {
+    state
+  } else {
+    { ..state, my_flinched: false, opp_flinched: false }
+  }
+}
+
+///|
+/// ふくつのこころ: ひるみで行動を止められた側の素早さランクを +1 する (`clamp_rank_for`)。
+/// 発火条件は `flinched_outcomes` の第 3 要素 (行動前にひるみが効いた枝) に限る。
+fn ws_with_flinch_speed_boost(
+  ws : TurnWorkspace,
+  is_me : Bool,
+  ability : String,
+) -> TurnWorkspace {
+  if !ability_flinch_speed_boost(ability) {
+    return ws
+  }
+  if is_me {
+    let my_ranks = ws.my_ranks.copy()
+    my_ranks[4] = clamp_rank_for(ability, my_ranks[4] + 1)
+    { ..ws, my_ranks }
+  } else {
+    let opp_ranks = ws.opp_ranks.copy()
+    opp_ranks[4] = clamp_rank_for(ability, opp_ranks[4] + 1)
+    { ..ws, opp_ranks }
+  }
+}
+
+///|
+/// `ws` の指定スロットの状態だけを差し替えた workspace (配列は複製)。
+fn ws_with_status(
+  ws : TurnWorkspace,
+  is_me : Bool,
+  slot : Int,
+  st : @model.StatusCondition,
+) -> TurnWorkspace {
+  if is_me {
+    let my_status = ws.my_status.copy()
+    my_status[slot] = st
+    { ..ws, my_status }
+  } else {
+    let opp_status = ws.opp_status.copy()
+    opp_status[slot] = st
+    { ..ws, opp_status }
+  }
+}
+
+///|
+/// 保留した試行 (こおり / ひるみ) を行動時点で解決する (DP)。`ws` は行動者の行動前 workspace
+/// (先攻の技の結果を反映済み)。
+/// - ひるみが成立している (`ws` の当該サイドの `*_flinched`): 命中判定なしの `flinched_outcomes`。
+///   行動はしない。ふくつのこころ が発火するなら素早さ +1。
+/// - ひるみなし: 解凍抽選 (`per_side_attempt`: 凍っていれば 25% / 3 回目は確定、defrost 技は
+///   解凍のみ) と命中判定を行い、行動した枝は `resolve_attacker_leg`、行動しなかった枝は状態だけ
+///   更新する。外れた枝は崩れ技 / てっていこうせん の自傷を行動者に適用する (`with_miss_self_loss`)。
+/// `pre_state` は命中判定の基準 (ターン頭の状態。`attempt_accuracy` と同じ)。
+fn resolve_pending_attempt(
+  ws : TurnWorkspace,
+  is_me : Bool,
+  mv : @model.Move,
+  mv_idx : Int,
+  mega_now : Bool,
+  def_mega_now : Bool,
+  pre_state : SwitchingGameState,
+  my_team : Array[Combatant],
+  opp_team : Array[Combatant],
+  dmg_cache : DamageCache,
+  foe_move : @model.Move?,
+) -> Array[(Double, SwitchingGameState)] {
+  let slot = if is_me { ws.my_active } else { ws.opp_active }
+  let user_team = if is_me { my_team } else { opp_team }
+  let status_now = if is_me { ws.my_status[slot] } else { ws.opp_status[slot] }
+  let flinched = if is_me { ws.my_flinched } else { ws.opp_flinched }
+  let thaws = freeze_move_thaws_user(pre_state, is_me, user_team, UseMove(mv_idx))
+  // `pre_state` はターン頭で、このターンのメガフラグはまだ無い。`mega_now` /
+  // `def_mega_now` がメガ後の実効特性・タイプ (Protean 解除込み) を渡す。
+  // 行動は UseMove に正規化済みなので、トリガは引数側にある。
+  let acc = if is_me {
+    attempt_accuracy(
+      pre_state, UseMove(mv_idx), true, my_team, opp_team,
+      attacker_mega_trigger=mega_now, defender_mega_trigger=def_mega_now,
+    )
+  } else {
+    attempt_accuracy(
+      pre_state, UseMove(mv_idx), false, opp_team, my_team,
+      attacker_mega_trigger=mega_now, defender_mega_trigger=def_mega_now,
+    )
+  }
+  let result : Array[(Double, SwitchingGameState)] = []
+  if flinched {
+    // ひるみ成立: 行動しない (命中判定なし)。眠り / 凍結の継続はひるみより先に効く。
+    let outs = flinched_outcomes(status_now, thaws)
+    for i = 0; i < outs.length(); i = i + 1 {
+      let (p, post, steadfast) = outs[i]
+      let ws_o = ws_with_status(ws, is_me, slot, post)
+      let holder_ability = holder_ability_of(
+        pre_state,
+        is_me,
+        slot,
+        user_team,
+      )
+      let ws_f = if steadfast {
+        ws_with_flinch_speed_boost(ws_o, is_me, holder_ability)
+      } else {
+        ws_o
+      }
+      result.push((p, ws_to_state(ws_f, bump_turn=false)))
+    }
+    return result
+  }
+  for o in per_side_attempt(status_now, false, UseMove(mv_idx), acc, thaws_user=thaws) {
+    let s_o = ws_to_state(ws_with_status(ws, is_me, slot, o.post_status), bump_turn=false)
+    if o.acts {
+      // 解凍して命中: 技は通常どおり解決する (解凍後の状態で。こおりの燃焼等は無関係)。
+      for leg in resolve_attacker_leg(
+        ws_from_state(s_o), is_me, mv, mv_idx, mega_now, def_mega_now, false,
+        my_team, opp_team, dmg_cache, foe_move,
+      ) {
+        let (p, s) = leg
+        result.push((o.prob * p, s))
+      }
+    } else {
+      // 行動しない (凍結の継続 / 解凍した上での外れ)。外れは自傷のみ残す。
+      let s_m = if o.miss {
+        with_miss_self_loss(s_o, is_me, slot, user_team, mv)
+      } else {
+        s_o
+      }
+      result.push((o.prob, s_m))
+    }
+  }
+  result
 }
 
 ///|
@@ -80,6 +380,11 @@ priv struct TurnWorkspace {
   // しない (1 戦闘 1 回のみ)。
   my_disguise_busted : Array[Bool]
   opp_disguise_busted : Array[Bool]
+  my_flinched : Bool
+  opp_flinched : Bool
+  // ターン開始時の ねこだまし / であいがしら 初行動フラグ。行動の成否では途中更新しない。
+  my_fresh : Bool?
+  opp_fresh : Bool?
   my_moves_used : Array[Int]
   opp_moves_used : Array[Int]
   // Stage 2 (healing-moves plan): mirror the new state fields so
@@ -100,6 +405,9 @@ priv struct TurnWorkspace {
   // defaults; Move.field_set consumption and EOT counter tick land in Stage E.
   field : @model.Field
   field_turns_left : Int
+  // SwitchingGameState と同じ slot ごとのもらいび状態。ws round-trip で落とさない。
+  my_flash_fire : Array[Bool]
+  opp_flash_fire : Array[Bool]
   turn : Int
 }
 
@@ -124,6 +432,10 @@ fn ws_from_state(state : SwitchingGameState) -> TurnWorkspace {
     opp_item_consumed: state.opp_item_consumed.copy(),
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used: state.my_moves_used.copy(),
     opp_moves_used: state.opp_moves_used.copy(),
     weather: state.weather,
@@ -136,6 +448,8 @@ fn ws_from_state(state : SwitchingGameState) -> TurnWorkspace {
     opp_wish_turns: state.opp_wish_turns,
     field: state.field,
     field_turns_left: state.field_turns_left,
+    my_flash_fire: state.my_flash_fire.copy(),
+    opp_flash_fire: state.opp_flash_fire.copy(),
     turn: state.turn,
   }
 }
@@ -161,6 +475,10 @@ fn ws_to_state(ws : TurnWorkspace, bump_turn~ : Bool) -> SwitchingGameState {
     opp_item_consumed: ws.opp_item_consumed.copy(),
     my_disguise_busted: ws.my_disguise_busted.copy(),
     opp_disguise_busted: ws.opp_disguise_busted.copy(),
+    my_flinched: ws.my_flinched,
+    opp_flinched: ws.opp_flinched,
+    my_fresh: ws.my_fresh,
+    opp_fresh: ws.opp_fresh,
     my_moves_used: ws.my_moves_used.copy(),
     opp_moves_used: ws.opp_moves_used.copy(),
     weather: ws.weather,
@@ -173,6 +491,8 @@ fn ws_to_state(ws : TurnWorkspace, bump_turn~ : Bool) -> SwitchingGameState {
     opp_wish_turns: ws.opp_wish_turns,
     field: ws.field,
     field_turns_left: ws.field_turns_left,
+    my_flash_fire: ws.my_flash_fire.copy(),
+    opp_flash_fire: ws.opp_flash_fire.copy(),
     turn: if bump_turn {
       ws.turn + 1
     } else {
@@ -205,6 +525,7 @@ fn psychic_blocks_priority(
   move_priority : Int,
   defender : Combatant,
   defender_megaed : Bool,
+  attacker_ability? : String = "",
 ) -> Bool {
   if move_priority <= 0 {
     return false
@@ -215,11 +536,67 @@ fn psychic_blocks_priority(
       @damage.is_grounded(
         type1=def_eff.pokemon.type1,
         type2=def_eff.pokemon.type2,
-        ability=def_eff.ability,
+        ability=defender_ability_for_move(attacker_ability, def_eff.ability),
         item=def_eff.item,
       )
     }
     _ => false
+  }
+}
+
+///|
+/// 変化技が実効の受け手に効かないときの単一 leaf。Protean と自爆、崩れ、
+/// てっていこうせんだけが残る (`with_immune_effects` と同じ残り方)。
+/// 吸収は `status_move_fails_on_foe` が false なので、ここには来ない。
+/// `None` のとき呼び出し側は従来の解決に進む。
+fn status_move_fail_state(
+  state : SwitchingGameState,
+  attacker_is_me : Bool,
+  attacker_slot : Int,
+  defender_slot : Int,
+  attacker_team : Array[Combatant],
+  defender_team : Array[Combatant],
+  mv : @model.Move,
+  defender_hp : Int,
+) -> SwitchingGameState? {
+  match effective_hit_pair(
+    state,
+    attacker_is_me,
+    attacker_slot,
+    defender_slot,
+    attacker_team,
+    defender_team,
+    false,
+    false,
+  ) {
+    None => None
+    Some((atk, def)) =>
+      if status_move_fails_on_foe(atk, mv, def, state.weather) {
+        Some(
+          with_max_hp_recoil(
+            with_crash_damage(
+              with_immune_effects(
+                state,
+                attacker_is_me,
+                attacker_slot,
+                attacker_team,
+                mv,
+              ),
+              attacker_is_me,
+              attacker_slot,
+              attacker_team,
+              mv,
+            ),
+            attacker_is_me,
+            attacker_slot,
+            attacker_team,
+            mv,
+            defender_hp > 0,
+          ),
+        )
+      } else {
+        None
+      }
   }
 }
 
@@ -239,6 +616,7 @@ fn resolve_attacker_leg(
   my_team : Array[Combatant],
   opp_team : Array[Combatant],
   dmg_cache : DamageCache,
+  foe_move : @model.Move?,
 ) -> Array[(Double, SwitchingGameState)] {
   // Phase 2-E (#91): damage application + post-hit effects + 4 fanout は
   // apply_damage_variants_fanout に統合され、variant ごとに chance-node leaf
@@ -289,13 +667,63 @@ fn resolve_attacker_leg(
   let def_megaed_arr = if attacker_is_me { ws.opp_megaed } else { ws.my_megaed }
   let def_is_mega = defender_active < def_megaed_arr.length() &&
     def_megaed_arr[defender_active]
+  let atk_megaed_arr = if attacker_is_me { ws.my_megaed } else { ws.opp_megaed }
+  let atk_is_mega = attacker_active < atk_megaed_arr.length() &&
+    atk_megaed_arr[attacker_active]
+  let atk_hp_arr = if attacker_is_me { ws.my_hps } else { ws.opp_hps }
+  let atk_c = attacker_team[attacker_active]
+  let atk_prio = combatant_move_priority(
+    atk_c,
+    attacker_move,
+    atk_hp_arr[attacker_active],
+    atk_is_mega,
+  )
   if psychic_blocks_priority(
       ws.field,
-      attacker_move.priority,
+      atk_prio,
       defender_team_eff[defender_active],
       def_is_mega,
+      attacker_ability=effective_combatant(atk_c, atk_is_mega).ability,
     ) {
     return [(1.0, pre_damage_state)]
+  }
+  // ねこだまし / であいがしら: 登場後に技を使ったあと (`Some(false)`) は技自体が失敗する。
+  // ダメージもひるみも付けない。`None` は未指定なのでここでは失敗させない。
+  // 見るのは使用者の fresh。であいがしら にひるみは無い。
+  let user_fresh = if attacker_is_me { ws.my_fresh } else { ws.opp_fresh }
+  if fake_out_fails(attacker_move, user_fresh) ||
+    first_impression_fails(attacker_move, user_fresh) {
+    return [(1.0, pre_damage_state)]
+  }
+  // はやてがえし: 相手の選択の実効優先度が > 0 でなければ失敗する。ダメージもひるみも無い。
+  let foe_eff = effective_combatant(
+    defender_team_eff[defender_active],
+    def_is_mega,
+  )
+  if upper_hand_fails(
+      attacker_move,
+      foe_move,
+      foe_ability=foe_eff.ability,
+      foe_hp=defender_hps[defender_active],
+      foe_max_hp=foe_eff.pokemon.hp,
+    ) {
+    return [(1.0, pre_damage_state)]
+  }
+  // 変化技が受け手に効かない (状態異常免疫 / 粉 / でんじはのタイプ無効 / いたずらごころ)。
+  // 命中分岐は attempt 側で既に潰してある。ここは効果なし。Protean は残す。
+  // サイコフィールド / ねこだまし / はやてがえしより後 (それらに Protean は付かない)。
+  match status_move_fail_state(
+    pre_damage_state,
+    attacker_is_me,
+    attacker_active,
+    defender_active,
+    attacker_team,
+    defender_team_eff,
+    attacker_move,
+    pre_dmg_defender_hp,
+  ) {
+    Some(st) => return [(1.0, st)]
+    None => ()
   }
   // Protean/Libero: 攻撃側スロットの type は変化後タイプ (attacker STAB) に、
   // 被弾側スロットの type は変化後タイプ (防御相性) に override する。攻撃側の
@@ -324,7 +752,18 @@ fn resolve_attacker_leg(
   // damage transform で反映する (`disguise_intact_of` が SSoT)。pre_damage_state
   // は ws から round-trip 済みで disguise_busted を保持している。
   let def_disguise_intact = disguise_intact_of(
-    pre_damage_state, attacker_is_me, defender_team_eff, defender_active,
+    pre_damage_state,
+    attacker_is_me,
+    defender_team_eff,
+    defender_active,
+    attacker_ability=effective_combatant(atk_c, atk_is_mega).ability,
+  )
+  let (atk_flash_fire, def_flash_fire) = side_flash_fire(
+    ws.my_flash_fire,
+    ws.opp_flash_fire,
+    attacker_is_me,
+    attacker_active,
+    defender_active,
   )
   let outcomes = damage_variants_cached(
     dmg_cache,
@@ -346,9 +785,11 @@ fn resolve_attacker_leg(
     atk_protean_locked~,
     def_protean_locked~,
     def_disguise_intact~,
+    atk_flash_fire~,
+    def_flash_fire~,
   )
-  apply_damage_variants_fanout(
-    pre_damage_state,
+      apply_damage_variants_fanout(
+        pre_damage_state,
     outcomes,
     attacker_is_me~,
     attacker_active~,
@@ -386,6 +827,8 @@ fn resolve_moves(
   my_team : Array[Combatant],
   opp_team : Array[Combatant],
   dmg_cache : DamageCache,
+  my_pending? : Bool = false,
+  opp_pending? : Bool = false,
 ) -> Array[(Double, SwitchingGameState)] {
   let ws = ws_from_state(state)
   if my_mega_now {
@@ -444,10 +887,21 @@ fn resolve_moves(
   }
   // Step 1: first attacker acts. Damage + stat boost applied, then the
   // attacker's status move (if any) fans out onto the second actor.
-  let after_first = resolve_attacker_leg(
-    ws, first_is_me, first_move, first_mv_idx, first_mega_now, first_def_mega_now,
-    first_pre_burn, my_team, opp_team, dmg_cache,
-  )
+  // こおり: 遅らせた側 (`freeze_roll_deferred`) の試行は行動時点で振る (先攻はこの時点、
+  // 後攻は先攻の技の後)。
+  let first_pending = if my_first { my_pending } else { opp_pending }
+  let second_pending = if my_first { opp_pending } else { my_pending }
+  let after_first = if first_pending {
+    resolve_pending_attempt(
+      ws, first_is_me, first_move, first_mv_idx, first_mega_now, first_def_mega_now,
+      state, my_team, opp_team, dmg_cache, Some(second_move),
+    )
+  } else {
+    resolve_attacker_leg(
+      ws, first_is_me, first_move, first_mv_idx, first_mega_now, first_def_mega_now,
+      first_pre_burn, my_team, opp_team, dmg_cache, Some(second_move),
+    )
+  }
   // Step 2: for each branch, resolve the second attacker with the potentially
   // updated status (fresh burn halves their physical damage; fresh sleep
   // locks them out entirely).
@@ -470,23 +924,48 @@ fn resolve_moves(
       final_outs.push((p1, clone_state(s1, 1)))
       continue
     }
-    // Second actor newly slept / frozen mid-turn: skip their move.
+    // こおり: 後攻の遅らせた試行 (解凍抽選 + 命中) を先攻の技の結果を見てから振る。
+    if second_pending {
+      for x in resolve_pending_attempt(
+        ws_from_state(s1), second_is_me, second_move, second_mv_idx,
+        second_mega_now, second_def_mega_now, state, my_team, opp_team, dmg_cache,
+        Some(first_move),
+      ) {
+        let (p2, s2) = x
+        final_outs.push((p1 * p2, clone_state(s2, 1)))
+      }
+      continue
+    }
+    // Second actor newly slept / frozen mid-turn: skip their move. For sleep
+    // this landing turn is the sleeper's first move attempt (sure skip), so
+    // the counter steps down here (`consume_sleep_attempt_on_block`).
     if action_blocked_by_fresh_status(second_pre_status, second_now_status) {
-      final_outs.push((p1, clone_state(s1, 1)))
+      let s2 = clone_state(s1, 1)
+      let consumed = consume_sleep_attempt_on_block(second_now_status)
+      if second_is_me {
+        s2.my_status[second_attacker_active] = consumed
+      } else {
+        s2.opp_status[second_attacker_active] = consumed
+      }
+      final_outs.push((p1, s2))
       continue
     }
     let second_burn = is_burned(second_now_status)
     let ws2 = ws_from_state(s1)
     let after_second = resolve_attacker_leg(
       ws2, second_is_me, second_move, second_mv_idx, second_mega_now, second_def_mega_now,
-      second_burn, my_team, opp_team, dmg_cache,
+      second_burn, my_team, opp_team, dmg_cache, Some(first_move),
     )
     for x in after_second {
       let (p2, s2) = x
       final_outs.push((p1 * p2, clone_state(s2, 1)))
     }
   }
-  final_outs
+  // ひるみフラグはこのターンの後攻の試行で使い切る。出口でどちらも false に戻す。
+  final_outs.map(fn(x) {
+    let (p, s) = x
+    (p, clear_turn_flinch(s))
+  })
 }
 
 ///|
@@ -517,6 +996,10 @@ fn clone_state(
     opp_item_consumed: state.opp_item_consumed.copy(),
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used: state.my_moves_used.copy(),
     opp_moves_used: state.opp_moves_used.copy(),
     weather: state.weather,
@@ -529,6 +1012,8 @@ fn clone_state(
     opp_wish_turns: state.opp_wish_turns,
     field: state.field,
     field_turns_left: state.field_turns_left,
+    my_flash_fire: state.my_flash_fire.copy(),
+    opp_flash_fire: state.opp_flash_fire.copy(),
     turn: state.turn + turn_delta,
   }
 }
@@ -547,6 +1032,21 @@ pub fn target_active(state : SwitchingGameState, is_me : Bool) -> Int {
 /// Read the Protean/Libero type lock for `slot` on the `is_me` side from a
 /// `SwitchingGameState`. Returns "" (= no lock) when out of bounds, so callers
 /// that pass it to `damage_variants_cached` default to base-type behaviour.
+///|
+/// (attacker lit, defender lit) for the damage cache. Empty arrays read as false.
+fn side_flash_fire(
+  my_ff : Array[Bool],
+  opp_ff : Array[Bool],
+  attacker_is_me : Bool,
+  atk_slot : Int,
+  def_slot : Int,
+) -> (Bool, Bool) {
+  let atk_flags = if attacker_is_me { my_ff } else { opp_ff }
+  let def_flags = if attacker_is_me { opp_ff } else { my_ff }
+  (flash_fire_lit(atk_flags, atk_slot), flash_fire_lit(def_flags, def_slot))
+}
+
+///|
 fn protean_locked_of(
   state : SwitchingGameState,
   is_me : Bool,
@@ -579,11 +1079,16 @@ fn disguise_intact_of(
   attacker_is_me : Bool,
   defender_team : Array[Combatant],
   target_slot : Int,
+  attacker_ability? : String = "",
 ) -> Bool {
   if target_slot < 0 || target_slot >= defender_team.length() {
     return false
   }
-  if defender_team[target_slot].ability != "ばけのかわ" {
+  let ability = defender_ability_for_move(
+    attacker_ability,
+    defender_team[target_slot].ability,
+  )
+  if ability != "ばけのかわ" {
     return false
   }
   let busted_arr = if attacker_is_me {
@@ -616,12 +1121,36 @@ fn apply_intimidate_entry(
     entrant_megaed[entrant_slot]
   let target_mega = target_slot < target_megaed.length() &&
     target_megaed[target_slot]
+  // フラワーベールはメガ後の実効タイプがくさのときだけいかくを防ぐ。特性文字列は
+  // 従来と同じ effective_combatant の ability。タイプを読まない特性は
+  // apply_intimidate_on_entry 側でこの引数を見ない。
+  let target_eff = effective_combatant(target_team[target_slot], target_mega)
   apply_intimidate_on_entry(
     effective_combatant(entrant_team[entrant_slot], entrant_mega).ability,
-    effective_combatant(target_team[target_slot], target_mega).ability,
+    target_eff.ability,
     target_ranks,
     entrant_ranks,
+    target_type1=target_eff.pokemon.type1,
+    target_type2=target_eff.pokemon.type2,
   )
+}
+
+///|
+/// 再生力の DP 配線。出ていく slot の mega 後実効特性で判定し、最大 HP は
+/// `pokemon.hp`（メガは HP を変えない。HP プールの上限）。ひんし・非再生力は
+/// helper 内で no-op。登場時いかくより前（switch-out → switch-in）に呼ぶ。
+fn apply_regenerator_switch_out(
+  team : Array[Combatant],
+  slot : Int,
+  megaed : Array[Bool],
+  hps : Array[Int],
+) -> Unit {
+  if slot < 0 || slot >= team.length() || slot >= hps.length() {
+    return
+  }
+  let is_mega = slot < megaed.length() && megaed[slot]
+  let eff = effective_combatant(team[slot], is_mega)
+  apply_regenerator_on_switch_out(eff.ability, hps, slot, eff.pokemon.hp)
 }
 
 ///|
@@ -642,6 +1171,8 @@ pub fn transition_with_cache(
   my_team : Array[Combatant],
   opp_team : Array[Combatant],
   dmg_cache : DamageCache,
+  my_pending? : Bool = false,
+  opp_pending? : Bool = false,
 ) -> Array[(Double, SwitchingGameState)] {
   // Normalise `Mega(mi)` into `UseMove(mi)` plus a same-turn mega trigger.
   // This keeps the existing per-pair arms minimal and funnels every damage
@@ -671,6 +1202,8 @@ pub fn transition_with_cache(
   // arm では state.copy() が base_state にそのまま流れるので影響なし。
   let my_leech_seeded_new = state.my_leech_seeded.copy()
   let opp_leech_seeded_new = state.opp_leech_seeded.copy()
+  let my_flash_fire_new = state.my_flash_fire.copy()
+  let opp_flash_fire_new = state.opp_flash_fire.copy()
   let my_protean_locked_new = state.my_protean_locked.copy()
   let opp_protean_locked_new = state.opp_protean_locked.copy()
   if my_mega_trigger {
@@ -685,6 +1218,14 @@ pub fn transition_with_cache(
     if state.opp_active < opp_protean_locked_new.length() {
       opp_protean_locked_new[state.opp_active] = ""
     }
+  }
+  // しろいハーブ: メガ進化の直後に両 active を判定する (Showdown onAnyAfterMega)。
+  // メガはランクを変えないので、実到達では no-op (held_item_stat_reset.mbt 参照)。
+  if my_mega_trigger || opp_mega_trigger {
+    apply_held_item_stat_reset_pair(
+      my_team, state.my_active, my_hps_new, my_ranks_new, my_item_consumed_new,
+      opp_team, state.opp_active, opp_hps_new, opp_ranks_new, opp_item_consumed_new,
+    )
   }
   let my_mega_used_new = state.my_mega_used || my_mega_trigger
   let opp_mega_used_new = state.opp_mega_used || opp_mega_trigger
@@ -727,6 +1268,9 @@ pub fn transition_with_cache(
       if state.opp_active < opp_leech_seeded_new.length() {
         opp_leech_seeded_new[state.opp_active] = false
       }
+      // もらいび状態は出ていく slot で消える (volatile)。メガでは消さない。
+      clear_flash_fire_slot(my_flash_fire_new, state.my_active)
+      clear_flash_fire_slot(opp_flash_fire_new, state.opp_active)
       // Stage 4: switched-out slot の Protean/Libero ロックを解除。再登場時に
       // 未発動 ("") へ戻すことで新しいタイプで再発動できる。leech_seeded と
       // 同じ境界ガード・同じ index で出ていくスロットをリセットする。
@@ -736,6 +1280,13 @@ pub fn transition_with_cache(
       if state.opp_active < opp_protean_locked_new.length() {
         opp_protean_locked_new[state.opp_active] = ""
       }
+      // 再生力: 出ていく slot だけ。同時交代でも互いの回復は独立。ひんしは不発。
+      apply_regenerator_switch_out(
+        my_team, state.my_active, my_megaed_new, my_hps_new,
+      )
+      apply_regenerator_switch_out(
+        opp_team, state.opp_active, opp_megaed_new, opp_hps_new,
+      )
       // 登場時いかく: 双方同時登場は entrant ごとに 1 回ずつ。いかく持ちと
       // 反射系特性は同一個体に同居しないので呼び出し順は結果に影響しない。
       apply_intimidate_entry(
@@ -758,10 +1309,15 @@ pub fn transition_with_cache(
       if state.my_active < my_leech_seeded_new.length() {
         my_leech_seeded_new[state.my_active] = false
       }
+      clear_flash_fire_slot(my_flash_fire_new, state.my_active)
       // Stage 4: switched-out my slot の Protean/Libero ロックを解除。
       if state.my_active < my_protean_locked_new.length() {
         my_protean_locked_new[state.my_active] = ""
       }
+      // 再生力: 自分の出ていく slot。交代先 (i) と相手 active は回復しない。
+      apply_regenerator_switch_out(
+        my_team, state.my_active, my_megaed_new, my_hps_new,
+      )
       // 登場時いかく: base_state 構築前 (= 交代→いかく→技 の本家順序)。この
       // 直後の opp の物理技は A-1 の opp_ranks_new で計算される。
       apply_intimidate_entry(
@@ -797,10 +1353,15 @@ pub fn transition_with_cache(
       if state.opp_active < opp_leech_seeded_new.length() {
         opp_leech_seeded_new[state.opp_active] = false
       }
+      clear_flash_fire_slot(opp_flash_fire_new, state.opp_active)
       // Stage 4: switched-out opp slot の Protean/Libero ロックを解除。
       if state.opp_active < opp_protean_locked_new.length() {
         opp_protean_locked_new[state.opp_active] = ""
       }
+      // 再生力: 相手の出ていく slot。交代先 (j) と自分 active は回復しない。
+      apply_regenerator_switch_out(
+        opp_team, state.opp_active, opp_megaed_new, opp_hps_new,
+      )
       // 登場時いかく: base_state 構築前 (= 交代→いかく→技 の本家順序)。my の
       // 物理技は A-1 の my_ranks_new で計算される。
       apply_intimidate_entry(
@@ -828,8 +1389,18 @@ pub fn transition_with_cache(
       let my_para = is_paralyzed(state.my_status[state.my_active])
       let opp_para = is_paralyzed(state.opp_status[state.opp_active])
       let s = move_turn_sign(
-        me, my_ranks_new, mv_me, my_mega_now, my_para, opp, opp_ranks_new, mv_opp,
-        opp_mega_now, opp_para,
+        me,
+        my_ranks_new,
+        mv_me,
+        my_mega_now,
+        my_para,
+        state.my_hps[state.my_active],
+        opp,
+        opp_ranks_new,
+        mv_opp,
+        opp_mega_now,
+        opp_para,
+        state.opp_hps[state.opp_active],
       )
       // Last Resort 解禁判定用に両サイドの move を「使用済み」として記録。
       // resolve_moves は state を ws に変換して回すので、state を新しい mask で
@@ -851,23 +1422,31 @@ pub fn transition_with_cache(
         for
           half in resolve_moves(
             state_marked, mi, mj, true, my_mega_now, opp_mega_now, my_team, opp_team,
-            dmg_cache,
+            dmg_cache, my_pending=my_pending, opp_pending=opp_pending,
           ) {
           outs.push((0.5 * half.0, half.1))
         }
         for
           half in resolve_moves(
             state_marked, mi, mj, false, my_mega_now, opp_mega_now, my_team, opp_team,
-            dmg_cache,
+            dmg_cache, my_pending=my_pending, opp_pending=opp_pending,
           ) {
           outs.push((0.5 * half.0, half.1))
         }
-        return outs
+        return settle_fresh_outcomes(
+          outs, state.my_fresh, state.opp_fresh, my_action, opp_action,
+        )
       } else {
         let my_first = s > 0
-        return resolve_moves(
-          state_marked, mi, mj, my_first, my_mega_now, opp_mega_now, my_team, opp_team,
-          dmg_cache,
+        return settle_fresh_outcomes(
+          resolve_moves(
+            state_marked, mi, mj, my_first, my_mega_now, opp_mega_now, my_team, opp_team,
+            dmg_cache, my_pending=my_pending, opp_pending=opp_pending,
+          ),
+          state.my_fresh,
+          state.opp_fresh,
+          my_action,
+          opp_action,
         )
       }
     }
@@ -876,6 +1455,12 @@ pub fn transition_with_cache(
     // Any remaining arm is unreachable — treat as a no-op turn advance.
     (_, _) => ()
   }
+  // しろいハーブ: 登場時いかく (Switch arm 内) の直後に両 active を判定する。登場した
+  // 個体は技より前に判定されるので、いかく で下がった能力はこのターンの技に効く前に解除される。
+  apply_held_item_stat_reset_pair(
+    my_team, my_active_new, my_hps_new, my_ranks_new, my_item_consumed_new,
+    opp_team, opp_active_new, opp_hps_new, opp_ranks_new, opp_item_consumed_new,
+  )
   let base_state : SwitchingGameState = {
     my_active: my_active_new,
     opp_active: opp_active_new,
@@ -898,6 +1483,10 @@ pub fn transition_with_cache(
     // apply_damage_variants_fanout が copy-on-write で行う。
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used: my_moves_used_new,
     opp_moves_used: opp_moves_used_new,
     weather: state.weather,
@@ -910,9 +1499,13 @@ pub fn transition_with_cache(
     opp_wish_turns: state.opp_wish_turns,
     field: state.field,
     field_turns_left: state.field_turns_left,
+    my_flash_fire: my_flash_fire_new,
+    opp_flash_fire: opp_flash_fire_new,
     turn: state.turn + 1,
   }
-  match attack_event {
+  // fresh はターン開始値から決める。途中のコピーが落としてもここで上書きする。
+  settle_fresh_outcomes(
+    match attack_event {
     None => [(1.0, base_state)]
     Some((attacker_is_me, target_slot, used_move, mv_idx)) => {
       let attacker_slot = target_active(base_state, attacker_is_me)
@@ -942,13 +1535,77 @@ pub fn transition_with_cache(
       // Switch-vs-UseMove の DP path にも適用する。これがないと priority 技が
       // Psychic 下の grounded な switch-in に当たってしまう。base_state は
       // 既に turn を advance 済みなので blocked leaf は base_state をそのまま返す。
+      // 優先度は特性補正込み (いたずらごころ / はやてのつばさ)。
+      let atk_hp_switch = if attacker_is_me {
+        base_state.my_hps[attacker_slot]
+      } else {
+        base_state.opp_hps[attacker_slot]
+      }
       if psychic_blocks_priority(
           base_state.field,
-          used_move.priority,
+          combatant_move_priority(
+            attacker_team[attacker_slot],
+            used_move,
+            atk_hp_switch,
+            attacker_mega,
+          ),
           defender_team_eff[target_slot],
           defender_mega,
+          attacker_ability=effective_combatant(
+            attacker_team[attacker_slot],
+            attacker_mega,
+          ).ability,
         ) {
-        return [(1.0, base_state)]
+        return settle_fresh_outcomes(
+          [(1.0, base_state)],
+          state.my_fresh,
+          state.opp_fresh,
+          my_action,
+          opp_action,
+        )
+      }
+      // ねこだまし / であいがしら は登場後の初行動でなければ失敗する。交代は先制攻撃
+      // ではないので はやてがえし も失敗する (ダメージもひるみも無い)。
+      let user_fresh = if attacker_is_me {
+        base_state.my_fresh
+      } else {
+        base_state.opp_fresh
+      }
+      if fake_out_fails(used_move, user_fresh) ||
+        first_impression_fails(used_move, user_fresh) ||
+        upper_hand_fails(used_move, None) {
+        return settle_fresh_outcomes(
+          [(1.0, base_state)],
+          state.my_fresh,
+          state.opp_fresh,
+          my_action,
+          opp_action,
+        )
+      }
+      // 交代先が変化技を無効にする。出ていく側の無効では潰さない (slot は target)。
+      match status_move_fail_state(
+        base_state,
+        attacker_is_me,
+        attacker_slot,
+        target_slot,
+        attacker_team,
+        defender_team_eff,
+        used_move,
+        if attacker_is_me {
+          base_state.opp_hps[target_slot]
+        } else {
+          base_state.my_hps[target_slot]
+        },
+      ) {
+        Some(st) =>
+          return settle_fresh_outcomes(
+            [(1.0, st)],
+            state.my_fresh,
+            state.opp_fresh,
+            my_action,
+            opp_action,
+          )
+        None => ()
       }
       let attacker_burn = if attacker_is_me {
         is_burned(state.my_status[state.my_active])
@@ -983,7 +1640,21 @@ pub fn transition_with_cache(
       )
       // ばけのかわ: 被弾側 slot が ばけのかわ intact なら初段ブロック + chip。
       let def_disguise_intact = disguise_intact_of(
-        base_state, attacker_is_me, defender_team_eff, target_slot,
+        base_state,
+        attacker_is_me,
+        defender_team_eff,
+        target_slot,
+        attacker_ability=effective_combatant(
+          attacker_team[attacker_slot],
+          attacker_mega,
+        ).ability,
+      )
+      let (atk_flash_fire, def_flash_fire) = side_flash_fire(
+        base_state.my_flash_fire,
+        base_state.opp_flash_fire,
+        attacker_is_me,
+        attacker_slot,
+        target_slot,
       )
       let outcomes = damage_variants_cached(
         dmg_cache,
@@ -1005,6 +1676,8 @@ pub fn transition_with_cache(
         atk_protean_locked~,
         def_protean_locked~,
         def_disguise_intact~,
+        atk_flash_fire~,
+        def_flash_fire~,
       )
       apply_damage_variants_fanout(
         base_state,
@@ -1018,7 +1691,12 @@ pub fn transition_with_cache(
         pre_dmg_defender_hp~,
       )
     }
-  }
+  },
+    state.my_fresh,
+    state.opp_fresh,
+    my_action,
+    opp_action,
+  )
 }
 
 ///|
@@ -1067,6 +1745,75 @@ fn action_accuracy(
   match action {
     Switch(_) => 100
     UseMove(mi) | Mega(mi) => team[active].moves[mi].accuracy
+  }
+}
+
+///|
+/// Accuracy of `action` for the attempt-phase split (`per_side_attempt`).
+/// Showdown runs TryHit (absorb), TypeImmunity, and TryImmunity before
+/// Accuracy, so an absorbed move, or a damaging move the defender is immune
+/// to, is fixed at 100. The defender and the attacker's move type are the
+/// post-mega `effective_combatant` (ability, types, Protean override). This
+/// runs before `turn_start_mega` writes the flags, so a Mega chosen this turn
+/// is `attacker_mega_trigger` / `defender_mega_trigger` (or `Mega` on `action`).
+/// Every other action keeps `action_accuracy`.
+///
+/// Switches resolve before moves, so the defender is the Pokémon that will be
+/// on the field when the move runs. `defender_switch_slot >= 0` is that
+/// incoming slot (`Switch` of the defender). Immunity against the Pokémon
+/// that is switching out must not cancel the miss into the switch-in.
+fn attempt_accuracy(
+  state : SwitchingGameState,
+  action : ActionKind,
+  attacker_is_me : Bool,
+  attacker_team : Array[Combatant],
+  defender_team : Array[Combatant],
+  attacker_mega_trigger? : Bool = false,
+  defender_mega_trigger? : Bool = false,
+  defender_switch_slot? : Int = -1,
+) -> Int {
+  let attacker_active = if attacker_is_me {
+    state.my_active
+  } else {
+    state.opp_active
+  }
+  let defender_active = if defender_switch_slot >= 0 {
+    defender_switch_slot
+  } else if attacker_is_me {
+    state.opp_active
+  } else {
+    state.my_active
+  }
+  let atk_trigger = attacker_mega_trigger || is_mega_action(action)
+  let skips = match action {
+    Switch(_) => false
+    UseMove(mi) | Mega(mi) =>
+      move_skips_accuracy(
+        state,
+        attacker_is_me,
+        attacker_active,
+        defender_active,
+        attacker_team,
+        defender_team,
+        attacker_team[attacker_active].moves[mi],
+        atk_trigger,
+        defender_mega_trigger,
+      )
+  }
+  if skips {
+    100
+  } else {
+    action_accuracy(action, attacker_active, attacker_team)
+  }
+}
+
+///|
+/// Slot a `Switch` brings in, or `-1` when the action is not a switch.
+/// `attempt_accuracy` uses it as the defender that actually receives the move.
+fn switch_slot_of(action : ActionKind) -> Int {
+  match action {
+    Switch(j) => j
+    _ => -1
   }
 }
 
@@ -1123,6 +1870,10 @@ fn pass_turn_state(
     opp_item_consumed: state.opp_item_consumed.copy(),
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used: state.my_moves_used.copy(),
     opp_moves_used: state.opp_moves_used.copy(),
     weather: state.weather,
@@ -1135,7 +1886,80 @@ fn pass_turn_state(
     opp_wish_turns: state.opp_wish_turns,
     field: state.field,
     field_turns_left: state.field_turns_left,
+    my_flash_fire: state.my_flash_fire.copy(),
+    opp_flash_fire: state.opp_flash_fire.copy(),
     turn: state.turn + 1,
+  }
+}
+
+///|
+/// メガ進化のターン頭適用。Showdown では megaEvo が独立の行動 (行動順 104、技は 200) として
+/// 技より前に走り、`runMegaEvo` は命中・まひ・ねむり・外れ・免疫・先制 KO のいずれも見ない。
+/// よって使用者の技が行動しない枝でも進化は起きる。両者行動の枝は `transition_with_cache` が
+/// 同じ適用 (mega trigger) を行うので、`attempt_turn_with_cache` は一方または両方が行動しない
+/// 枝でだけこの helper を呼ぶ。適用内容は mega trigger と同じ: `*_megaed` / `*_mega_used` /
+/// Protean ロック解除 / しろいハーブ (onAnyAfterMega、両 active)。Mega 行動が無ければ state を
+/// そのまま返す。
+fn turn_start_mega(
+  state : SwitchingGameState,
+  my_action : ActionKind,
+  opp_action : ActionKind,
+  my_team : Array[Combatant],
+  opp_team : Array[Combatant],
+) -> SwitchingGameState {
+  let my_trigger = is_mega_action(my_action)
+  let opp_trigger = is_mega_action(opp_action)
+  if !my_trigger && !opp_trigger {
+    return state
+  }
+  let my_megaed = state.my_megaed.copy()
+  let opp_megaed = state.opp_megaed.copy()
+  let my_protean_locked = state.my_protean_locked.copy()
+  let opp_protean_locked = state.opp_protean_locked.copy()
+  let my_hps = state.my_hps.copy()
+  let opp_hps = state.opp_hps.copy()
+  let my_ranks = state.my_ranks.copy()
+  let opp_ranks = state.opp_ranks.copy()
+  let my_item_consumed = state.my_item_consumed.copy()
+  let opp_item_consumed = state.opp_item_consumed.copy()
+  if my_trigger {
+    my_megaed[state.my_active] = true
+    if state.my_active < my_protean_locked.length() {
+      my_protean_locked[state.my_active] = ""
+    }
+  }
+  if opp_trigger {
+    opp_megaed[state.opp_active] = true
+    if state.opp_active < opp_protean_locked.length() {
+      opp_protean_locked[state.opp_active] = ""
+    }
+  }
+  apply_held_item_stat_reset_pair(
+    my_team,
+    state.my_active,
+    my_hps,
+    my_ranks,
+    my_item_consumed,
+    opp_team,
+    state.opp_active,
+    opp_hps,
+    opp_ranks,
+    opp_item_consumed,
+  )
+  {
+    ..state,
+    my_hps,
+    opp_hps,
+    my_ranks,
+    opp_ranks,
+    my_megaed,
+    opp_megaed,
+    my_mega_used: state.my_mega_used || my_trigger,
+    opp_mega_used: state.opp_mega_used || opp_trigger,
+    my_protean_locked,
+    opp_protean_locked,
+    my_item_consumed,
+    opp_item_consumed,
   }
 }
 
@@ -1148,7 +1972,9 @@ fn pass_turn_state(
 /// drives resolution (with pre-turn status overrides applied so burn / para
 /// damage-calc helpers see the post-attempt status). For outcomes where one
 /// or both sides skip, `pass_turn_state` / partial-execution arms build the
-/// next state directly.
+/// next state directly. In those skip arms a Mega action still evolves its
+/// user at turn start (`turn_start_mega`), so the Mega flags are applied
+/// before the arm runs.
 ///
 /// **Turn counter contract** (single source of truth): every branch returned
 /// by the four cases below — `transition_with_cache` (both act),
@@ -1169,27 +1995,107 @@ pub fn attempt_turn_with_cache(
   opp_team : Array[Combatant],
   dmg_cache : DamageCache,
 ) -> Array[(Double, SwitchingGameState)] {
-  let my_acc = action_accuracy(my_action, state.my_active, my_team)
-  let opp_acc = action_accuracy(opp_action, state.opp_active, opp_team)
+  // 命中判定はメガフラグを書く前。このターンの Mega を実効特性・タイプへ渡す。
+  let my_mega_trigger = is_mega_action(my_action)
+  let opp_mega_trigger = is_mega_action(opp_action)
+  let my_acc = attempt_accuracy(
+    state, my_action, true, my_team, opp_team,
+    attacker_mega_trigger=my_mega_trigger,
+    defender_mega_trigger=opp_mega_trigger,
+    defender_switch_slot=switch_slot_of(opp_action),
+  )
+  let opp_acc = attempt_accuracy(
+    state, opp_action, false, opp_team, my_team,
+    attacker_mega_trigger=opp_mega_trigger,
+    defender_mega_trigger=my_mega_trigger,
+    defender_switch_slot=switch_slot_of(my_action),
+  )
   let my_attempts = per_side_attempt(
     state.my_status[state.my_active],
     state.my_must_recharge[state.my_active],
     my_action,
     my_acc,
+    thaws_user=freeze_move_thaws_user(state, true, my_team, my_action),
   )
   let opp_attempts = per_side_attempt(
     state.opp_status[state.opp_active],
     state.opp_must_recharge[state.opp_active],
     opp_action,
     opp_acc,
+    thaws_user=freeze_move_thaws_user(state, false, opp_team, opp_action),
   )
-  let results : Array[(Double, SwitchingGameState)] = []
-  for ma in my_attempts {
-    for oa in opp_attempts {
-      let joint = ma.prob * oa.prob
-      if joint <= 0.0 {
-        continue
+  // こおりの解凍抽選を行動時点へ遅らせる側は「保留」の試行 (`true`) として扱い、
+  // transition 側で振る。相手が行動しない枝では遅らせる意味がないので、保留側は事前抽選の
+  // 試行に戻す (`my_plain` / `opp_plain`)。保留以外の枝の順序は従来と同じ。
+  let my_plain : Array[(SideAttempt, Bool)] = my_attempts.map(fn(a) { (a, false) })
+  let opp_plain : Array[(SideAttempt, Bool)] = opp_attempts.map(fn(a) { (a, false) })
+  let my_entries : Array[(SideAttempt, Bool)] = if attempt_roll_deferred(
+    state, true, my_action, my_team, opp_action, opp_team,
+  ) {
+    [
+      (
+        {
+          prob: 1.0,
+          acts: true,
+          action: my_action,
+          post_status: state.my_status[state.my_active],
+          miss: false,
+        },
+        true,
+      ),
+    ]
+  } else {
+    my_plain
+  }
+  let opp_entries : Array[(SideAttempt, Bool)] = if attempt_roll_deferred(
+    state, false, opp_action, opp_team, my_action, my_team,
+  ) {
+    [
+      (
+        {
+          prob: 1.0,
+          acts: true,
+          action: opp_action,
+          post_status: state.opp_status[state.opp_active],
+          miss: false,
+        },
+        true,
+      ),
+    ]
+  } else {
+    opp_plain
+  }
+  let pairs : Array[(SideAttempt, Bool, SideAttempt, Bool)] = []
+  for ma0_e in my_entries {
+    let (_, ma0_pend) = ma0_e
+    for oa0_e in opp_entries {
+      let (oa0, oa0_pend) = oa0_e
+      let my_set = if ma0_pend && !oa0.acts {
+        my_plain
+      } else {
+        [ma0_e]
       }
+      for ma_e in my_set {
+        let (ma, ma_pend) = ma_e
+        let opp_set = if oa0_pend && !ma.acts {
+          opp_plain
+        } else {
+          [oa0_e]
+        }
+        for oa_e in opp_set {
+          let (oa, oa_pend) = oa_e
+          pairs.push((ma, ma_pend, oa, oa_pend))
+        }
+      }
+    }
+  }
+  let results : Array[(Double, SwitchingGameState)] = []
+  for pr in pairs {
+    let (ma, ma_pend, oa, oa_pend) = pr
+    let joint = ma.prob * oa.prob
+    if joint <= 0.0 {
+      continue
+    }
       // Apply the attempt-phase status overrides to the active slots so
       // downstream damage / action-order logic reads the post-attempt status.
       let pre_state : SwitchingGameState = {
@@ -1219,6 +2125,10 @@ pub fn attempt_turn_with_cache(
         opp_item_consumed: state.opp_item_consumed,
         my_disguise_busted: state.my_disguise_busted,
         opp_disguise_busted: state.opp_disguise_busted,
+        my_flinched: state.my_flinched,
+        opp_flinched: state.opp_flinched,
+        my_fresh: state.my_fresh,
+        opp_fresh: state.opp_fresh,
         my_moves_used: state.my_moves_used,
         opp_moves_used: state.opp_moves_used,
         weather: state.weather,
@@ -1231,42 +2141,66 @@ pub fn attempt_turn_with_cache(
         opp_wish_turns: state.opp_wish_turns,
         field: state.field,
         field_turns_left: state.field_turns_left,
+        my_flash_fire: state.my_flash_fire.copy(),
+        opp_flash_fire: state.opp_flash_fire.copy(),
         turn: state.turn,
       }
+      // メガ進化はターン頭に起きる。両者行動の枝は transition_with_cache が適用するので
+      // そのまま渡し、それ以外の枝 (非行動側の Mega を含む) は先に `turn_start_mega` で適用する。
+      let mega_pre = if ma.acts && oa.acts {
+        pre_state
+      } else {
+        turn_start_mega(pre_state, ma.action, oa.action, my_team, opp_team)
+      }
+      // 崩れ技 / てっていこうせん の外れ (`SideAttempt.miss`) は使用者の HP 消費を含むので専用経路へ。
+      let crash_miss = attempt_has_miss_self_loss(
+        mega_pre,
+        ma,
+        oa,
+        my_team,
+        opp_team,
+      )
       let branch_outs : Array[(Double, SwitchingGameState)] = match
-        (ma.acts, oa.acts) {
-        (true, true) =>
+        (ma.acts, oa.acts, crash_miss) {
+        (_, _, true) =>
+          miss_self_loss_outcomes(mega_pre, ma, oa, my_team, opp_team, dmg_cache)
+        (true, true, false) =>
           transition_with_cache(
-            pre_state,
+            mega_pre,
             ma.action,
             oa.action,
             my_team,
             opp_team,
             dmg_cache,
+            my_pending=ma_pend,
+            opp_pending=oa_pend,
           )
-        (true, false) =>
-          partial_act_outcomes(
-            pre_state,
-            ma.action,
-            true,
-            my_team,
-            opp_team,
-            dmg_cache,
+        (true, false, false) =>
+          partial_act_with_miss_protean(
+            mega_pre, ma, oa, true, my_team, opp_team, dmg_cache,
           )
-        (false, true) =>
-          partial_act_outcomes(
-            pre_state,
-            oa.action,
-            false,
-            my_team,
-            opp_team,
-            dmg_cache,
+        (false, true, false) =>
+          partial_act_with_miss_protean(
+            mega_pre, ma, oa, false, my_team, opp_team, dmg_cache,
           )
-        (false, false) =>
-          [(1.0, pass_turn_state(pre_state, ma.post_status, oa.post_status))]
+        (false, false, false) => {
+          let s0 = pass_turn_state(mega_pre, ma.post_status, oa.post_status)
+          let s1 = match missed_move_of(ma, my_team, s0.my_active) {
+            Some(mv) =>
+              with_protean_on_use_state(s0, true, s0.my_active, my_team, mv)
+            None => s0
+          }
+          let s2 = match missed_move_of(oa, opp_team, s1.opp_active) {
+            Some(mv) =>
+              with_protean_on_use_state(s1, false, s1.opp_active, opp_team, mv)
+            None => s1
+          }
+          [(1.0, s2)]
+        }
       }
       for s in branch_outs {
-        let (p, ns_pre_eot) = s
+        let (p, ns_flat) = s
+        let ns_pre_eot = clear_turn_flinch(ns_flat)
         // Consume must_recharge **only for slots that had the flag set at
         // turn start** (they just paid their one-turn penalty). Slots that
         // gained the flag *this turn* via a recharge move (Hyper Beam etc.)
@@ -1281,11 +2215,118 @@ pub fn attempt_turn_with_cache(
           state.opp_must_recharge[state.opp_active],
         )
         let ns = apply_eot(ns_recharge_cleared, my_team, opp_team)
-        results.push((joint * p, ns))
+        // 選んだ行動で fresh を更新する。技がひるみ・眠り・まひ・外れで止まっても
+        // UseMove / Mega は消費する (Showdown は runMove の入口で数える)。
+        // transition 側が先に同じ開始値から決めていても結果は同じ。
+        let settled = with_turn_fresh(
+          ns, state.my_fresh, state.opp_fresh, my_action, opp_action,
+        )
+        results.push((joint * p, settled))
+      }
+  }
+  results
+}
+
+///|
+/// The move a side used and missed, or `None` when it never reached accuracy
+/// (sleep, paralysis, flinch, recharge). `SideAttempt.miss` is only the
+/// accuracy miss.
+fn missed_move_of(
+  attempt : SideAttempt,
+  team : Array[Combatant],
+  active : Int,
+) -> @model.Move? {
+  if !attempt.miss {
+    return None
+  }
+  action_move_of(team, active, attempt.action)
+}
+
+///|
+/// One side acts. If the other side's move missed and that miss would write a
+/// new Protean / Libero lock, the type changes in speed order around the
+/// acting side. Showdown runs `PrepareHit` before Accuracy, so a faster miss
+/// is already the new type when the slower move lands. A switch always
+/// resolves before the missed move. Speed ties average both orders, matching
+/// `miss_self_loss_outcomes`.
+///
+/// When the miss would not write a lock (no ability, already locked, already
+/// that single type), this is exactly `partial_act_outcomes`. Averaging two
+/// identical orders is not bitwise identical after a deep tree and shifts
+/// `pkdx select`.
+fn partial_act_with_miss_protean(
+  state : SwitchingGameState,
+  ma : SideAttempt,
+  oa : SideAttempt,
+  actor_is_me : Bool,
+  my_team : Array[Combatant],
+  opp_team : Array[Combatant],
+  dmg_cache : DamageCache,
+) -> Array[(Double, SwitchingGameState)] {
+  let actor_action = if actor_is_me { ma.action } else { oa.action }
+  let idle = if actor_is_me { oa } else { ma }
+  let idle_is_me = !actor_is_me
+  let idle_team = if idle_is_me { my_team } else { opp_team }
+  let idle_active = if idle_is_me { state.my_active } else { state.opp_active }
+  let act = fn(base : SwitchingGameState) {
+    partial_act_outcomes(
+      base,
+      actor_action,
+      actor_is_me,
+      my_team,
+      opp_team,
+      dmg_cache,
+      idle.action,
+    )
+  }
+  match missed_move_of(idle, idle_team, idle_active) {
+    None => act(state)
+    Some(mv) => {
+      if !protean_miss_would_lock(
+        state, idle_is_me, idle_active, idle_team, mv,
+      ) {
+        return act(state)
+      }
+      let missed_first = match actor_action {
+        Switch(_) => -1
+        _ => {
+          let sign = attempt_turn_sign(state, ma, oa, my_team, opp_team)
+          if idle_is_me {
+            sign
+          } else {
+            -sign
+          }
+        }
+      }
+      let protean_first = fn() {
+        act(with_protean_on_use_state(state, idle_is_me, idle_active, idle_team, mv))
+      }
+      let protean_second = fn() {
+        let outs : Array[(Double, SwitchingGameState)] = []
+        for out in act(state) {
+          outs.push((
+            out.0,
+            with_protean_on_use_state(out.1, idle_is_me, idle_active, idle_team, mv),
+          ))
+        }
+        outs
+      }
+      if missed_first > 0 {
+        protean_first()
+      } else if missed_first < 0 {
+        protean_second()
+      } else {
+        let outs : Array[(Double, SwitchingGameState)] = []
+        for x in protean_first() {
+          outs.push((0.5 * x.0, x.1))
+        }
+        for x in protean_second() {
+          outs.push((0.5 * x.0, x.1))
+        }
+        outs
       }
     }
   }
-  results
 }
 
 ///|
@@ -1300,6 +2341,7 @@ fn partial_act_outcomes(
   my_team : Array[Combatant],
   opp_team : Array[Combatant],
   dmg_cache : DamageCache,
+  idle_action : ActionKind,
 ) -> Array[(Double, SwitchingGameState)] {
   let (core, mega_trigger) = normalize_action(action)
   let my_status_copy = state.my_status.copy()
@@ -1321,6 +2363,8 @@ fn partial_act_outcomes(
   // (base_state はこのコピーを参照する)。
   let my_protean_locked = state.my_protean_locked.copy()
   let opp_protean_locked = state.opp_protean_locked.copy()
+  let my_flash_fire = state.my_flash_fire.copy()
+  let opp_flash_fire = state.opp_flash_fire.copy()
   let mut my_active = state.my_active
   let mut opp_active = state.opp_active
   let mut my_mega_used = state.my_mega_used
@@ -1344,6 +2388,11 @@ fn partial_act_outcomes(
       if state.my_active < my_protean_locked.length() {
         my_protean_locked[state.my_active] = ""
       }
+      clear_flash_fire_slot(my_flash_fire, state.my_active)
+      // 再生力: 自分の出ていく slot。相手が skip でも交代で回復する。
+      apply_regenerator_switch_out(
+        my_team, state.my_active, my_megaed, my_hps,
+      )
       // 登場時いかく: 相手が skip でも交代登場で発動する。
       apply_intimidate_entry(
         my_team,
@@ -1368,6 +2417,11 @@ fn partial_act_outcomes(
       if state.opp_active < opp_protean_locked.length() {
         opp_protean_locked[state.opp_active] = ""
       }
+      clear_flash_fire_slot(opp_flash_fire, state.opp_active)
+      // 再生力: 相手の出ていく slot。自分が skip でも交代で回復する。
+      apply_regenerator_switch_out(
+        opp_team, state.opp_active, opp_megaed, opp_hps,
+      )
       // 登場時いかく: 相手が skip でも交代登場で発動する。
       apply_intimidate_entry(
         opp_team,
@@ -1417,6 +2471,12 @@ fn partial_act_outcomes(
     }
     (_, _) => ()
   }
+  // しろいハーブ: 登場時いかく / メガ進化の直後に両 active を判定する (transition_with_cache
+  // と同じ位置。ここでは技は撃たれないので、登場・メガの後で判定すれば各判定点を覆う)。
+  apply_held_item_stat_reset_pair(
+    my_team, my_active, my_hps, my_ranks, my_item_consumed,
+    opp_team, opp_active, opp_hps, opp_ranks, opp_item_consumed,
+  )
   let base_state : SwitchingGameState = {
     my_active,
     opp_active,
@@ -1438,6 +2498,10 @@ fn partial_act_outcomes(
     // は attack_event の apply_damage_variants_fanout が担う。
     my_disguise_busted: state.my_disguise_busted.copy(),
     opp_disguise_busted: state.opp_disguise_busted.copy(),
+    my_flinched: state.my_flinched,
+    opp_flinched: state.opp_flinched,
+    my_fresh: state.my_fresh,
+    opp_fresh: state.opp_fresh,
     my_moves_used,
     opp_moves_used,
     weather: state.weather,
@@ -1450,6 +2514,8 @@ fn partial_act_outcomes(
     opp_wish_turns: state.opp_wish_turns,
     field: state.field,
     field_turns_left: state.field_turns_left,
+    my_flash_fire,
+    opp_flash_fire,
     turn: state.turn + 1,
   }
   match attack_event {
@@ -1481,13 +2547,76 @@ fn partial_act_outcomes(
       // Stage G-3: partial-act (相手が para/sleep/miss で skip) でも actor の
       // priority 技は Psychic 下の grounded defender に当たってはならない。
       // resolve_attacker_leg / Switch-vs-UseMove path と同じ guard を funnel する。
+      // 優先度は特性補正込み。
+      let atk_hp_partial = if attacker_is_me {
+        base_state.my_hps[attacker_slot]
+      } else {
+        base_state.opp_hps[attacker_slot]
+      }
       if psychic_blocks_priority(
           base_state.field,
-          used_move.priority,
+          combatant_move_priority(
+            attacker_team[attacker_slot],
+            used_move,
+            atk_hp_partial,
+            attacker_mega,
+          ),
           defender_team_eff[target_slot],
           defender_mega,
+          attacker_ability=effective_combatant(
+            attacker_team[attacker_slot],
+            attacker_mega,
+          ).ability,
         ) {
         return [(1.0, base_state)]
+      }
+      // ねこだまし / であいがしら の失敗ゲート。fresh の更新は attempt_turn の出口で行う。
+      let user_fresh = if attacker_is_me {
+        base_state.my_fresh
+      } else {
+        base_state.opp_fresh
+      }
+      if fake_out_fails(used_move, user_fresh) ||
+        first_impression_fails(used_move, user_fresh) {
+        return [(1.0, base_state)]
+      }
+      // 動かなかった側の選択技。実行できたかは見ない (リチャージ・眠りでも選択は残る)。
+      // ゲートは選択の実効優先度を見る。
+      let foe_move = if attacker_is_me {
+        action_move_of(opp_team, state.opp_active, idle_action)
+      } else {
+        action_move_of(my_team, state.my_active, idle_action)
+      }
+      let foe_eff = effective_combatant(
+        defender_team_eff[target_slot],
+        defender_mega,
+      )
+      let foe_hp_partial = if attacker_is_me {
+        base_state.opp_hps[target_slot]
+      } else {
+        base_state.my_hps[target_slot]
+      }
+      if upper_hand_fails(
+          used_move,
+          foe_move,
+          foe_ability=foe_eff.ability,
+          foe_hp=foe_hp_partial,
+          foe_max_hp=foe_eff.pokemon.hp,
+        ) {
+        return [(1.0, base_state)]
+      }
+      match status_move_fail_state(
+        base_state,
+        attacker_is_me,
+        attacker_slot,
+        target_slot,
+        attacker_team,
+        defender_team_eff,
+        used_move,
+        foe_hp_partial,
+      ) {
+        Some(st) => return [(1.0, st)]
+        None => ()
       }
       let attacker_burn = if attacker_is_me {
         is_burned(state.my_status[state.my_active])
@@ -1522,7 +2651,21 @@ fn partial_act_outcomes(
       )
       // ばけのかわ: 被弾側 slot が ばけのかわ intact なら初段ブロック + chip。
       let def_disguise_intact = disguise_intact_of(
-        base_state, attacker_is_me, defender_team_eff, target_slot,
+        base_state,
+        attacker_is_me,
+        defender_team_eff,
+        target_slot,
+        attacker_ability=effective_combatant(
+          attacker_team[attacker_slot],
+          attacker_mega,
+        ).ability,
+      )
+      let (atk_flash_fire, def_flash_fire) = side_flash_fire(
+        base_state.my_flash_fire,
+        base_state.opp_flash_fire,
+        attacker_is_me,
+        attacker_slot,
+        target_slot,
       )
       let outcomes = damage_variants_cached(
         dmg_cache,
@@ -1544,6 +2687,8 @@ fn partial_act_outcomes(
         atk_protean_locked~,
         def_protean_locked~,
         def_disguise_intact~,
+        atk_flash_fire~,
+        def_flash_fire~,
       )
       apply_damage_variants_fanout(
         base_state,
@@ -1617,6 +2762,58 @@ const VALUE_PRUNE_EPS : Double = 1.0e-12
 pub let silent_dp_fallback_count : Ref[Int] = { val: 0 }
 
 ///|
+/// Observational counters for `pkdx select-bench`.
+///
+/// Default `dp_profile_enabled = false`. While false, `value` and
+/// `screen_nash_scores` only read the flag; they do not change returned
+/// values, prune decisions, or which solver runs. While true, the counters
+/// below increment. Not thread-safe — same constraint as
+/// `silent_dp_fallback_count`. `dp_profile_nodes` counts cache misses
+/// (expanded DP nodes). `dp_profile_lp` counts `solve_zero_sum` calls inside
+/// `value` that returned `Optimal` (saddle / prune paths are not LPs).
+/// `dp_profile_screen_lp` counts the Phase B screening Nash solve.
+pub let dp_profile_enabled : Ref[Bool] = { val: false }
+
+///|
+pub let dp_profile_nodes : Ref[Int] = { val: 0 }
+
+///|
+pub let dp_profile_hits : Ref[Int] = { val: 0 }
+
+///|
+pub let dp_profile_lp : Ref[Int] = { val: 0 }
+
+///|
+pub let dp_profile_lp_fail : Ref[Int] = { val: 0 }
+
+///|
+pub let dp_profile_saddle : Ref[Int] = { val: 0 }
+
+///|
+pub let dp_profile_pruned : Ref[Int] = { val: 0 }
+
+///|
+pub let dp_profile_screen_lp : Ref[Int] = { val: 0 }
+
+///|
+pub fn dp_profile_reset() -> Unit {
+  dp_profile_nodes.val = 0
+  dp_profile_hits.val = 0
+  dp_profile_lp.val = 0
+  dp_profile_lp_fail.val = 0
+  dp_profile_saddle.val = 0
+  dp_profile_pruned.val = 0
+  dp_profile_screen_lp.val = 0
+}
+
+///|
+fn dp_profile_add(counter : Ref[Int]) -> Unit {
+  if dp_profile_enabled.val {
+    counter.val = counter.val + 1
+  }
+}
+
+///|
 /// Recursive Nash value of a `SwitchingGameState`. Solves a per-state zero-sum
 /// matrix whose cells are `value(next_state, ...)` for each action pair.
 /// Memoized by `cache` (state-value memo) and `dmg_cache` (damage-table memo);
@@ -1657,9 +2854,13 @@ pub fn value(
   match cache.get(state) {
     Some(v) => {
       stats.hits = stats.hits + 1
+      dp_profile_add(dp_profile_hits)
       return v
     }
-    None => stats.misses = stats.misses + 1
+    None => {
+      stats.misses = stats.misses + 1
+      dp_profile_add(dp_profile_nodes)
+    }
   }
   let actions_me = alive_actions(
     state.my_active,
@@ -1739,6 +2940,7 @@ pub fn value(
   if pruned_early {
     // Do NOT cache: the returned value is a lower bound, not the exact Nash.
     // A different caller with a wider β would miss the true value.
+    dp_profile_add(dp_profile_pruned)
     maybe_emit_dp_node(stats, depth, rows, cols, total_outcomes, "pruned")
     return lower
   }
@@ -1763,6 +2965,7 @@ pub fn value(
   // caller with a tighter `α` would miss the true Nash. Symmetric to the
   // β-cutoff above (which returns `lower` as a valid lower bound).
   if upper <= alpha + VALUE_PRUNE_EPS {
+    dp_profile_add(dp_profile_pruned)
     maybe_emit_dp_node(stats, depth, rows, cols, total_outcomes, "alpha_pruned")
     return upper
   }
@@ -1772,6 +2975,7 @@ pub fn value(
   if upper - lower <= VALUE_SADDLE_TOL {
     let saddle = (upper + lower) / 2.0
     cache.set(state, saddle)
+    dp_profile_add(dp_profile_saddle)
     maybe_emit_dp_node(stats, depth, rows, cols, total_outcomes, "saddle")
     return saddle
   }
@@ -1782,12 +2986,19 @@ pub fn value(
   let lp = @nash.solve_zero_sum(m) catch {
     _ => {
       silent_dp_fallback_count.val = silent_dp_fallback_count.val + 1
+      dp_profile_add(dp_profile_lp_fail)
       return 0.0
     }
   }
   let result = match lp {
-    Optimal(value~, ..) => value
-    _ => 0.0
+    Optimal(value~, ..) => {
+      dp_profile_add(dp_profile_lp)
+      value
+    }
+    _ => {
+      dp_profile_add(dp_profile_lp_fail)
+      0.0
+    }
   }
   cache.set(state, result)
   maybe_emit_dp_node(stats, depth, rows, cols, total_outcomes, "nash")
@@ -1837,6 +3048,8 @@ pub fn switching_game_winrate(
   disk? : @damage_cache.DamageDiskCache? = None,
   progress? : (ProgressEvent) -> Unit = noop_progress,
   dp_log_every? : Int = 0,
+  my_fresh? : Bool? = None,
+  opp_fresh? : Bool? = None,
 ) -> Double {
   let (v, _, _) = switching_game_winrate_stats(
     my_team,
@@ -1845,6 +3058,8 @@ pub fn switching_game_winrate(
     disk~,
     progress~,
     dp_log_every~,
+    my_fresh~,
+    opp_fresh~,
   )
   v
 }
@@ -1861,6 +3076,8 @@ pub fn switching_game_winrate_stats(
   disk? : @damage_cache.DamageDiskCache? = None,
   progress? : (ProgressEvent) -> Unit = noop_progress,
   dp_log_every? : Int = 0,
+  my_fresh? : Bool? = None,
+  opp_fresh? : Bool? = None,
 ) -> (Double, ValueStats, DamageCache) {
   let my_hps = Array::make(my_team.length(), 0)
   let opp_hps = Array::make(opp_team.length(), 0)
@@ -1889,6 +3106,11 @@ pub fn switching_game_winrate_stats(
     opp_item_consumed: Array::make(opp_team.length(), false),
     my_disguise_busted: Array::make(my_team.length(), false),
     opp_disguise_busted: Array::make(opp_team.length(), false),
+    my_flinched: false,
+    opp_flinched: false,
+    // 省略時は None。バトル開始のリードで ねこだまし / であいがしら を撃たせるときは Some(true)。
+    my_fresh: my_fresh,
+    opp_fresh: opp_fresh,
     my_moves_used: Array::make(my_team.length(), 0),
     opp_moves_used: Array::make(opp_team.length(), 0),
     weather: @model.Weather::None,
@@ -1901,6 +3123,8 @@ pub fn switching_game_winrate_stats(
     opp_wish_turns: no_wish_pending(opp_team.length()),
     field: @model.Field::None,
     field_turns_left: 0,
+    my_flash_fire: Array::make(my_team.length(), false),
+    opp_flash_fire: Array::make(opp_team.length(), false),
     turn: 0,
   }
   // 登場時いかく: 先発 lead 同士 (双方 slot 0、megaed 全 false)。再帰前なので
@@ -1924,6 +3148,11 @@ pub fn switching_game_winrate_stats(
     0,
     state.my_megaed,
     state.my_ranks,
+  )
+  // しろいハーブ: 先発の登場時いかく直後に両 lead を判定する (rank 配列は state 直書き)。
+  apply_held_item_stat_reset_pair(
+    my_team, 0, state.my_hps, state.my_ranks, state.my_item_consumed,
+    opp_team, 0, state.opp_hps, state.opp_ranks, state.opp_item_consumed,
   )
   let cache : @hashmap.HashMap[SwitchingGameState, Double] = @hashmap.HashMap([])
   let stats = new_stats_with_progress(progress, dp_log_every)
